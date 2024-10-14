@@ -1,0 +1,15 @@
+bin/*
+build/*
+dev/*
+*.o
+*.elf
+*.bin
+*.d
+*.ko
+*.mod.c
+*.mod.o
+*.mod.d
+*.cmd
+*.mod
+*.symvers
+*.order
