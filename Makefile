@@ -1,13 +1,14 @@
-# Object files and module definition
-obj-m += bao_iodispatcher.o
-bao_iodispatcher-y := dm.o driver.o intc.o io_client.o io_dispatcher.o ioctls.o ioeventfd.o irqfd.o
+# Declare targets as phony to ensure they always run
+.PHONY: io_dispatcher clean help
 
-# Targets for building, cleaning, and help
-host:
-	make -C $(KERN_DIR) M=$(PWD) CROSS_COMPILE=$(CROSS_COMPILE) ARCH=$(ARCH) modules
+# Target for building only the io_dispatcher module
+io_dispatcher:
+	$(MAKE) -C $(KERN_DIR) M=$(PWD)/io_dispatcher CROSS_COMPILE=$(CROSS_COMPILE) ARCH=$(ARCH) modules
 
+# Target for cleaning 
 clean:
-	make -C $(KERN_DIR) M=$(PWD) CROSS_COMPILE=$(CROSS_COMPILE) ARCH=$(ARCH) clean
+	$(MAKE) -C $(KERN_DIR) M=$(PWD) CROSS_COMPILE=$(CROSS_COMPILE) ARCH=$(ARCH) clean
 
+# Target for help
 help:
-	make -C $(KERN_DIR) M=$(PWD) CROSS_COMPILE=$(CROSS_COMPILE) ARCH=$(ARCH) help
+	$(MAKE) -C $(KERN_DIR) M=$(PWD) CROSS_COMPILE=$(CROSS_COMPILE) ARCH=$(ARCH) help
