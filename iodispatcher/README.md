@@ -14,7 +14,7 @@ export KERN_DIR=path/to/your/linux
 
 2. Build the out of tree kernel module:
 ```
-make io_dispatcher
+make iodispatcher
 ```
 
 3. Copy the `iodispatcher.ko` file to your target filesystem as `bao_iodispatcher.ko`.

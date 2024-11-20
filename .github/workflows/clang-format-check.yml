@@ -27,5 +27,5 @@ jobs:
       # Step 3: Run clang-format check
       - name: Run clang-format check
         run: |
-          FILES_TO_CHECK=$(find ./io_dispatcher ./ipc -name "*.c" -o -name "*.h")
+          FILES_TO_CHECK=$(find ./iodispatcher ./ipc -name "*.c" -o -name "*.h")
           clang-format-20 -i $FILES_TO_CHECK --dry-run --Werror
