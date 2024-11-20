@@ -204,7 +204,7 @@ err_io_dispatcher:
  * Unregister the driver from the kernel
  * @pdev: Platform device pointer
  */
-static void bao_io_dispatcher_driver_unregister(struct platform_device* pdev)
+static int bao_io_dispatcher_driver_unregister(struct platform_device* pdev)
 {
     struct bao_dm* dm;
 
@@ -218,6 +218,8 @@ static void bao_io_dispatcher_driver_unregister(struct platform_device* pdev)
         // unregister the interrupt
         bao_intc_unregister(dm);
     }
+
+    return 0;
 }
 
 static const struct of_device_id bao_io_dispatcher_driver_dt_ids[] = {
@@ -240,7 +242,7 @@ static int __init bao_io_dispatcher_driver_init(void)
 {
     int ret;
 
-    if ((bao_iodispatcher_cl = class_create(DEV_NAME)) == NULL) {
+    if ((bao_iodispatcher_cl = class_create(THIS_MODULE, DEV_NAME)) == NULL) {
         ret = -1;
         pr_err("unable to class_create " DEV_NAME " device\n");
         return ret;

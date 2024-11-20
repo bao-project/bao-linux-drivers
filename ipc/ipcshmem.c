@@ -297,7 +297,7 @@ static int __init bao_ipcshmem_init(void)
 {
     int ret;
 
-    if ((cl = class_create(DEV_NAME)) == NULL) {
+    if ((cl = class_create(THIS_MODULE, DEV_NAME)) == NULL) {
         ret = -1;
         pr_err("unable to class_create " DEV_NAME " device\n");
         return ret;

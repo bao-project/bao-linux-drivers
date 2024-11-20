@@ -258,7 +258,7 @@ static int bao_ioeventfd_handler(struct bao_io_client* client, struct bao_virtio
 
     // if matched, signal the eventfd
     if (p) {
-        eventfd_signal(p->eventfd);
+        eventfd_signal(p->eventfd, 1);
     }
     mutex_unlock(&client->dm->ioeventfds_lock);
 
