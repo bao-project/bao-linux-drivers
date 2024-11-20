@@ -17,7 +17,7 @@ export KERN_DIR=path/to/your/linux
 make io_dispatcher
 ```
 
-3. Copy the `bao_iodispatcher.ko` file to your target filesystem.
+3. Copy the `iodispatcher.ko` file to your target filesystem as `bao_iodispatcher.ko`.
 
 ### Run instructions
 

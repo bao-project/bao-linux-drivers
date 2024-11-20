@@ -16,7 +16,7 @@ export KERN_DIR=path/to/your/linux
 make ipc
 ```
 
-3. Copy the `bao_ipc.ko` file to your target filesystem.
+3. Copy the `ipc.ko` file to your target filesystem as `bao_ipc.ko`.
 
 ### Run instructions
 
