@@ -1,3 +1,3 @@
 # Object files and module definition
-obj-m += ipc.o
+obj-m += bao-ipc.o
 ipc-y := ipcshmem.o
