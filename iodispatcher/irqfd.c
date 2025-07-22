@@ -182,13 +182,13 @@ static int bao_irqfd_assign(struct bao_dm* dm, struct bao_irqfd* args)
 
     // get a reference to the file descriptor
     f = fdget(args->fd);
-    if (!f.file) {
+    if (!fd_file(f)) {
         ret = -EBADF;
         goto out;
     }
 
     // get the eventfd from the file descriptor
-    eventfd = eventfd_ctx_fileget(f.file);
+    eventfd = eventfd_ctx_fileget(fd_file(f));
     if (IS_ERR(eventfd)) {
         ret = PTR_ERR(eventfd);
         goto fail;
@@ -223,7 +223,7 @@ static int bao_irqfd_assign(struct bao_dm* dm, struct bao_irqfd* args)
     // (this function will internally call the custom poll function already
     // defined) any event signaled upon this stage will be handled by the custom
     // poll function
-    events = vfs_poll(f.file, &irqfd->pt);
+    events = vfs_poll(fd_file(f), &irqfd->pt);
 
     // if the event is signaled, signal Bao Hypervisor
     if (events & EPOLLIN) {
