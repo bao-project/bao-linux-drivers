@@ -225,13 +225,15 @@ static int bao_ipcshmem_probe(struct platform_device* pdev)
     return 0;
 }
 
-static void bao_ipcshmem_remove(struct platform_device* pdev)
+static int bao_ipcshmem_remove(struct platform_device* pdev)
 {
     struct bao_ipcshmem* bao = platform_get_drvdata(pdev);
 
     if (bao) {
         misc_deregister(&bao->miscdev);
     }
+
+    return 0;
 }
 
 static const struct of_device_id of_bao_ipcshmem_match[] = { { .compatible = "bao,ipcshmem" },
