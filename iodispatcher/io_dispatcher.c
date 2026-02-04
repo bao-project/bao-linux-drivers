@@ -5,47 +5,45 @@
  * Copyright (c) Bao Project and Contributors. All rights reserved.
  *
  * Authors:
- *	João Peixoto <joaopeixotooficial@gmail.com>
+ *	João Peixoto <joaopeixoto@osyx.tech>
+ *	José Martins <jose@osyx.tech>
+ *	David Cerdeira <davidmcerdeira@osyx.tech>
  */
 
 #include "bao.h"
 #include "hypercall.h"
-#include <linux/delay.h>
-#include <linux/eventfd.h>
-#include <linux/interrupt.h>
-#include <linux/io.h>
-#include <linux/kthread.h>
-#include <linux/mm.h>
-#include <linux/slab.h>
-#include <linux/workqueue.h>
 
-// Define a wrapper structure that contains both work_struct and the private
-// data (bao_dm)
+/**
+ * struct bao_io_dispatcher_work - Work item for I/O dispatching
+ * @work: Work struct for scheduling on workqueue
+ * @dm: Pointer to the associated Bao device model
+ *
+ * Represents a single work item that dispatches I/O requests
+ * for a specific Bao device model.
+ */
 struct bao_io_dispatcher_work {
     struct work_struct work;
     struct bao_dm* dm;
 };
 
+/* Array of I/O dispatcher work items, one per Bao DM */
 static struct bao_io_dispatcher_work io_dispatcher_work[BAO_IO_MAX_DMS];
 
-/**
- * Responsible for dispatching I/O requests for all I/O DMs
- * This function is called by the workqueue
- * @work: The work struct
- */
-static void io_dispatcher(struct work_struct* work);
-// Workqueue for the I/O requests
+/* Workqueues dedicated to dispatching I/O requests for each Bao DM */
 static struct workqueue_struct* bao_io_dispatcher_wq[BAO_IO_MAX_DMS];
 
 void bao_io_dispatcher_destroy(struct bao_dm* dm)
 {
-    // if the workqueue exists
+    if (WARN_ON_ONCE(!dm)) {
+        return;
+    }
+
     if (bao_io_dispatcher_wq[dm->info.id]) {
-        // pause the I/O Dispatcher
         bao_io_dispatcher_pause(dm);
-        // destroy the I/O Dispatcher workqueue
+
         destroy_workqueue(bao_io_dispatcher_wq[dm->info.id]);
-        // remove the interrupt handler
+        bao_io_dispatcher_wq[dm->info.id] = NULL;
+
         bao_intc_remove_handler();
     }
 }
@@ -53,116 +51,137 @@ void bao_io_dispatcher_destroy(struct bao_dm* dm)
 int bao_dispatch_io(struct bao_dm* dm)
 {
     struct bao_io_client* client;
+    struct bao_remio_hypercall_ctx ctx;
     struct bao_virtio_request req;
-    struct remio_hypercall_ret ret;
 
-    // update the request
-    // the dm_id is the Virtual Remote I/O ID
-    req.dm_id = dm->info.id;
-    // BAO_IO_ASK will extract the I/O request from the Remote I/O system
-    req.op = BAO_IO_ASK;
-    // clear the other fields (convention)
-    req.addr = 0;
-    req.value = 0;
-    req.request_id = 0;
+    if (WARN_ON_ONCE(!dm)) {
+        return -EINVAL;
+    }
 
-    // perform a Hypercall to get the I/O request from the Remote I/O system
-    // the ret.pending_requests value holds the number of requests that still need
-    // to be processed
-    ret = bao_hypercall_remio(&req);
+    ctx.dm_id = dm->info.id;
+    ctx.op = BAO_IO_ASK;
+    ctx.addr = 0;
+    ctx.value = 0;
+    ctx.request_id = 0;
 
-    if (ret.hyp_ret != 0 || ret.remio_hyp_ret != 0) {
+    if (bao_remio_hypercall(&ctx)) {
         return -EFAULT;
     }
 
-    // find the I/O client that the I/O request belongs to
+    req.dm_id = ctx.dm_id;
+    req.op = ctx.op;
+    req.addr = ctx.addr;
+    req.value = ctx.value;
+    req.access_width = ctx.access_width;
+    req.request_id = ctx.request_id;
+
     down_read(&dm->io_clients_lock);
     client = bao_io_client_find(dm, &req);
     if (!client) {
         up_read(&dm->io_clients_lock);
-        return -EEXIST;
+        return -ENODEV;
     }
 
-    // add the request to the end of the virtio_request list
-    bao_io_client_push_request(client, &req);
+    if (!bao_io_client_push_request(client, &req)) {
+        up_read(&dm->io_clients_lock);
+        return -EINVAL;
+    }
 
-    // wake up the handler thread which is waiting for requests on the wait queue
     wake_up_interruptible(&client->wq);
     up_read(&dm->io_clients_lock);
 
-    // return the number of request that still need to be processed
-    return ret.pending_requests;
-}
-
-static void io_dispatcher(struct work_struct* work)
-{
-    struct bao_io_dispatcher_work* bao_dm_work =
-        container_of(work, struct bao_io_dispatcher_work, work);
-    struct bao_dm* dm = bao_dm_work->dm;
-
-    // dispatch the I/O request for the device model
-    while (bao_dispatch_io(dm) > 0)
-        ; // while there are requests to be processed
+    return ctx.npend_req;
 }
 
 /**
- * Interrupt Controller handler for the I/O requests
- * @note: This function is called by the interrupt controller
- * when an interrupt is triggered (when a new I/O request is available)
- * @dm: The DM that triggered the interrupt
+ * io_dispatcher - Workqueue handler for dispatching I/O
+ * @work: Work struct representing this dispatch operation
+ *
+ * Handles all pending I/O requests for the associated Bao DM.
+ * Executed in process context by the workqueue.
+ */
+static void io_dispatcher(struct work_struct* work)
+{
+    struct bao_io_dispatcher_work* bao_dm_work;
+    struct bao_dm* dm;
+
+    if (WARN_ON_ONCE(!work)) {
+        return;
+    }
+
+    bao_dm_work = container_of(work, struct bao_io_dispatcher_work, work);
+    dm = bao_dm_work->dm;
+
+    if (WARN_ON_ONCE(!dm)) {
+        return;
+    }
+
+    while (bao_dispatch_io(dm) > 0) {
+        cpu_relax();
+    }
+}
+
+/**
+ * io_dispatcher_intc_handler - Interrupt handler for I/O requests
+ * @dm: Bao device model that triggered the interrupt
+ *
+ * Invoked by the interrupt controller when a new I/O request is available.
+ * Queues the corresponding work item onto the I/O dispatcher workqueue
+ * for processing in process context.
  */
 static void io_dispatcher_intc_handler(struct bao_dm* dm)
 {
-    // add the work to the workqueue
+    if (WARN_ON_ONCE(!dm || !bao_io_dispatcher_wq[dm->info.id])) {
+        return;
+    }
+
     queue_work(bao_io_dispatcher_wq[dm->info.id], &io_dispatcher_work[dm->info.id].work);
 }
 
 void bao_io_dispatcher_pause(struct bao_dm* dm)
 {
-    // remove the interrupt handler
+    if (WARN_ON_ONCE(!dm || !bao_io_dispatcher_wq[dm->info.id])) {
+        return;
+    }
+
     bao_intc_remove_handler();
-    // drain the workqueue (wait for all the work to finish)
+
     drain_workqueue(bao_io_dispatcher_wq[dm->info.id]);
 }
 
 void bao_io_dispatcher_resume(struct bao_dm* dm)
 {
-    // setup the interrupt handler
+    if (WARN_ON_ONCE(!dm || !bao_io_dispatcher_wq[dm->info.id])) {
+        return;
+    }
+
     bao_intc_setup_handler(io_dispatcher_intc_handler);
-    // add the work to the workqueue
+
     queue_work(bao_io_dispatcher_wq[dm->info.id], &io_dispatcher_work[dm->info.id].work);
 }
 
 int bao_io_dispatcher_init(struct bao_dm* dm)
 {
     char name[BAO_NAME_MAX_LEN];
-    snprintf(name, BAO_NAME_MAX_LEN, "bao-iodwq%u", dm->info.id);
 
-    // Create the I/O Dispatcher workqueue with high priority
+    if (WARN_ON_ONCE(!dm)) {
+        return -EINVAL;
+    }
+
+    snprintf(name, sizeof(name), "bao-iodwq%u", dm->info.id);
+
+    if (bao_io_dispatcher_wq[dm->info.id]) {
+        return -EBUSY;
+    }
     bao_io_dispatcher_wq[dm->info.id] = alloc_workqueue(name, WQ_HIGHPRI | WQ_MEM_RECLAIM, 1);
     if (!bao_io_dispatcher_wq[dm->info.id]) {
         return -ENOMEM;
     }
 
-    // Assign the custom data to the work
     io_dispatcher_work[dm->info.id].dm = dm;
-
-    // Initialize the work_struct
     INIT_WORK(&io_dispatcher_work[dm->info.id].work, io_dispatcher);
 
-    // setup the interrupt handler
     bao_intc_setup_handler(io_dispatcher_intc_handler);
 
     return 0;
-}
-
-int bao_io_dispatcher_setup(void)
-{
-    // Do nothing
-    return 0;
-}
-
-void bao_io_dispatcher_remove(void)
-{
-    // Do nothing
 }

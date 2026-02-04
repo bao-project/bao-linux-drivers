@@ -5,24 +5,27 @@
  * Copyright (c) Bao Project and Contributors. All rights reserved.
  *
  * Authors:
- *	João Peixoto <joaopeixotooficial@gmail.com>
+ *	João Peixoto <joaopeixoto@osyx.tech>
+ *	José Martins <jose@osyx.tech>
+ *	David Cerdeira <davidmcerdeira@osyx.tech>
  */
 
-#include "bao.h"
-#include "hypercall.h"
 #include <linux/eventfd.h>
 #include <linux/file.h>
 #include <linux/poll.h>
-#include <linux/slab.h>
+#include "bao.h"
+#include "hypercall.h"
 
 /**
- * struct irqfd - Properties of irqfd
- * @dm:	Associated DM pointer
- * @wait: Entry of wait-queue
- * @shutdown: Async shutdown work
- * @eventfd: Associated eventfd to poll
- * @list: Entry within &bao_dm.irqfds of irqfds of a DM
- * @pt:	Structure for select/poll on the associated eventfd
+ * struct irqfd - Properties of an IRQ eventfd
+ * @dm: Associated Bao device model
+ * @wait: Wait queue entry for blocking/waking
+ * @shutdown: Work struct for async shutdown
+ * @eventfd: Eventfd used to signal interrupts
+ * @list: List node within &bao_dm.irqfds
+ * @pt: Poll table for select/poll on the eventfd
+ *
+ * Represents an IRQ eventfd registered to a Bao device model.
  */
 struct irqfd {
     struct bao_dm* dm;
@@ -34,34 +37,37 @@ struct irqfd {
 };
 
 /**
- * Shutdown a irqfd
- * @irqfd: The irqfd to shutdown
+ * bao_irqfd_shutdown - Release and remove an irqfd
+ * @irqfd: IRQ eventfd to shut down (lock must be held)
  */
 static void bao_irqfd_shutdown(struct irqfd* irqfd)
 {
     u64 cnt;
+
+    if (WARN_ON_ONCE(!irqfd || !irqfd->dm)) {
+        return;
+    }
+
     lockdep_assert_held(&irqfd->dm->irqfds_lock);
 
-    // delete the irqfd from the list of irqfds
     list_del_init(&irqfd->list);
 
-    // remove the irqfd from the wait queue
     eventfd_ctx_remove_wait_queue(irqfd->eventfd, &irqfd->wait, &cnt);
 
-    // release the eventfd
     eventfd_ctx_put(irqfd->eventfd);
 
-    // free the irqfd
     kfree(irqfd);
 }
 
 /**
- * Inject a notify hypercall into the Bao Hypervisor
- * @id: The DM ID
+ * bao_irqfd_inject - Inject a notify hypercall into the Bao hypervisor
+ * @id: Bao DM ID
+ *
+ * Return: 0 on success, -EFAULT if the hypercall fails.
  */
 static int bao_irqfd_inject(int id)
 {
-    struct bao_virtio_request request = {
+    struct bao_remio_hypercall_ctx ctx = {
         .dm_id = id,
         .addr = 0,
         .op = BAO_IO_NOTIFY,
@@ -70,46 +76,44 @@ static int bao_irqfd_inject(int id)
         .request_id = 0,
     };
 
-    // notify the Hypervisor about the event
-    struct remio_hypercall_ret ret = bao_hypercall_remio(&request);
-
-    if (ret.hyp_ret != 0 || ret.remio_hyp_ret != 0) {
+    if (bao_remio_hypercall(&ctx)) {
         return -EFAULT;
     }
+
     return 0;
 }
 
 /**
- * Custom wake-up handling to be notified whenever underlying eventfd is
- * signaled.
- * @note: This function will be called by Linux kernel poll table (irqfd->pt)
- * whenever the eventfd is signaled.
- * @wait: Entry of wait-queue
- * @mode: Mode
- * @sync: Sync
- * @key: Poll bits
- * @return int
+ * bao_irqfd_wakeup - Custom wake-up handler for eventfd signaling
+ * @wait: Wait queue entry
+ * @mode: Mode flags
+ * @sync: Sync indicator
+ * @key: Poll bits (cast from void *)
+ *
+ * Called by the Linux kernel poll table when the underlying eventfd is signaled.
+ * Injects a Bao notify hypercall on POLLIN or schedules shutdown on POLLHUP.
+ *
+ * Return: 0 on success, a negative error code on failure
  */
 static int bao_irqfd_wakeup(wait_queue_entry_t* wait, unsigned int mode, int sync, void* key)
 {
-    unsigned long poll_bits = (unsigned long)key;
     struct irqfd* irqfd;
     struct bao_dm* dm;
+    unsigned long poll_bits;
 
-    // get the irqfd object from the wait queue
+    if (WARN_ON_ONCE(!wait || !key)) {
+        return -EINVAL;
+    }
+
     irqfd = container_of(wait, struct irqfd, wait);
-
-    // get the DM from the irqfd
     dm = irqfd->dm;
+    poll_bits = (unsigned long)key;
 
-    // check if the event is signaled
     if (poll_bits & POLLIN) {
-        // an event has been signaled, inject a irqfd
         bao_irqfd_inject(dm->info.id);
     }
 
     if (poll_bits & POLLHUP) {
-        // do shutdown work in thread to hold wqh->lock
         queue_work(dm->irqfd_server, &irqfd->shutdown);
     }
 
@@ -117,38 +121,47 @@ static int bao_irqfd_wakeup(wait_queue_entry_t* wait, unsigned int mode, int syn
 }
 
 /**
- * Register the file descriptor with the poll table and associate it with a wait
- * queue that the kernel will monitor for events
- * @file: The file to poll
- * @wqh: The wait queue head
- * @pt: The poll table
+ * bao_irqfd_poll_func - Register an IRQFD with a poll table
+ * @file: File to poll
+ * @wqh: Wait queue head
+ * @pt: Poll table
+ *
+ * Adds the irqfd's wait queue entry to the kernel wait queue for event monitoring.
  */
 static void bao_irqfd_poll_func(struct file* file, wait_queue_head_t* wqh, poll_table* pt)
 {
     struct irqfd* irqfd;
 
-    // get the irqfd from the file
+    if (WARN_ON_ONCE(!pt || !wqh)) {
+        return;
+    }
+
     irqfd = container_of(pt, struct irqfd, pt);
-    // add the irqfd wait queue entry to the wait queue
     add_wait_queue(wqh, &irqfd->wait);
 }
 
 /**
- * Shutdown a irqfd
- * @work: The work to shutdown the irqfd
+ * irqfd_shutdown_work - Workqueue handler to shutdown an irqfd
+ * @work: Work struct for the shutdown operation
+ *
+ * Removes and frees the irqfd from the DM under lock if it is still linked.
  */
 static void irqfd_shutdown_work(struct work_struct* work)
 {
     struct irqfd* irqfd;
     struct bao_dm* dm;
 
-    // get the irqfd from the work
-    irqfd = container_of(work, struct irqfd, shutdown);
+    if (WARN_ON_ONCE(!work)) {
+        return;
+    }
 
-    // get the DM from the irqfd
+    irqfd = container_of(work, struct irqfd, shutdown);
     dm = irqfd->dm;
 
-    // shutdown the irqfd
+    if (WARN_ON_ONCE(!dm)) {
+        return;
+    }
+
     mutex_lock(&dm->irqfds_lock);
     if (!list_empty(&irqfd->list)) {
         bao_irqfd_shutdown(irqfd);
@@ -157,110 +170,101 @@ static void irqfd_shutdown_work(struct work_struct* work)
 }
 
 /**
- * Assign an eventfd to a DM and create the associated irqfd.
- * @dm: The DM to assign the eventfd
- * @args: The &struct bao_irqfd to assign
+ * bao_irqfd_assign - Assign an eventfd to a DM and create an irqfd
+ * @dm: Bao device model to assign the eventfd
+ * @args: Configuration of the irqfd to assign
+ *
+ * Return: 0 on success, a negative error code on failure
  */
 static int bao_irqfd_assign(struct bao_dm* dm, struct bao_irqfd* args)
 {
     struct eventfd_ctx* eventfd = NULL;
-    struct irqfd *irqfd, *tmp;
+    struct irqfd* irqfd;
+    struct irqfd* tmp;
     __poll_t events;
     struct fd f;
     int ret = 0;
 
-    // allocate a new irqfd object
+    if (WARN_ON_ONCE(!dm || !args)) {
+        return -EINVAL;
+    }
+
     irqfd = kzalloc(sizeof(*irqfd), GFP_KERNEL);
     if (!irqfd) {
         return -ENOMEM;
     }
 
-    // initialize the irqfd
     irqfd->dm = dm;
     INIT_LIST_HEAD(&irqfd->list);
     INIT_WORK(&irqfd->shutdown, irqfd_shutdown_work);
 
-    // get a reference to the file descriptor
     f = fdget(args->fd);
     if (!fd_file(f)) {
         ret = -EBADF;
-        goto out;
+        goto out_free_irqfd;
     }
 
-    // get the eventfd from the file descriptor
     eventfd = eventfd_ctx_fileget(fd_file(f));
     if (IS_ERR(eventfd)) {
         ret = PTR_ERR(eventfd);
-        goto fail;
+        goto out_fdput;
     }
-
-    // assign the eventfd to the irqfd
     irqfd->eventfd = eventfd;
 
-    // define the custom callback for the wait queue to be notified whenever
-    // underlying eventfd is signaled (in this case we don't need to wake-up any
-    // task, just to be notified when the eventfd is signaled)
     init_waitqueue_func_entry(&irqfd->wait, bao_irqfd_wakeup);
-
-    // define the custom poll function behavior
     init_poll_funcptr(&irqfd->pt, bao_irqfd_poll_func);
 
-    // add the irqfd to the list of irqfds of the DM
     mutex_lock(&dm->irqfds_lock);
     list_for_each_entry(tmp, &dm->irqfds, list)
     {
-        if (irqfd->eventfd != tmp->eventfd) {
-            continue;
+        if (irqfd->eventfd == tmp->eventfd) {
+            ret = -EBUSY;
+            mutex_unlock(&dm->irqfds_lock);
+            goto out_put_eventfd;
         }
-        ret = -EBUSY;
-        mutex_unlock(&dm->irqfds_lock);
-        goto fail;
     }
     list_add_tail(&irqfd->list, &dm->irqfds);
     mutex_unlock(&dm->irqfds_lock);
 
-    // check the pending event in this stage by calling vfs_poll function
-    // (this function will internally call the custom poll function already
-    // defined) any event signaled upon this stage will be handled by the custom
-    // poll function
     events = vfs_poll(fd_file(f), &irqfd->pt);
-
-    // if the event is signaled, signal Bao Hypervisor
     if (events & EPOLLIN) {
         bao_irqfd_inject(dm->info.id);
     }
 
-    // release the file descriptor reference
     fdput(f);
     return 0;
-fail:
-    if (eventfd && !IS_ERR(eventfd)) {
-        eventfd_ctx_put(eventfd);
-    }
 
+out_put_eventfd:
+    eventfd_ctx_put(eventfd);
+out_fdput:
     fdput(f);
-out:
+out_free_irqfd:
     kfree(irqfd);
     return ret;
 }
 
 /**
- * Deassign an eventfd from a DM and destroy the associated irqfd.
- * @dm: The DM to deassign the eventfd
- * @args: The &struct bao_irqfd to deassign
+ * bao_irqfd_deassign - Deassign an eventfd and destroy the associated irqfd
+ * @dm: Bao device model to remove the irqfd from
+ * @args: Configuration of the irqfd to deassign
+ *
+ * Return: 0 on success, a negative error code on failure
  */
 static int bao_irqfd_deassign(struct bao_dm* dm, struct bao_irqfd* args)
 {
-    struct irqfd *irqfd, *tmp;
+    struct irqfd* irqfd;
+    struct irqfd* tmp;
     struct eventfd_ctx* eventfd;
 
-    // get the eventfd from the file descriptor
+    if (WARN_ON_ONCE(!dm || !args)) {
+        return -EINVAL;
+    }
+
     eventfd = eventfd_ctx_fdget(args->fd);
     if (IS_ERR(eventfd)) {
         return PTR_ERR(eventfd);
     }
 
-    // find the irqfd associated with the eventfd and shutdown it
     mutex_lock(&dm->irqfds_lock);
     list_for_each_entry_safe(irqfd, tmp, &dm->irqfds, list)
     {
@@ -271,7 +275,6 @@ static int bao_irqfd_deassign(struct bao_dm* dm, struct bao_irqfd* args)
     }
     mutex_unlock(&dm->irqfds_lock);
 
-    // release the eventfd
     eventfd_ctx_put(eventfd);
 
     return 0;
@@ -279,17 +282,14 @@ static int bao_irqfd_deassign(struct bao_dm* dm, struct bao_irqfd* args)
 
 int bao_irqfd_server_config(struct bao_dm* dm, struct bao_irqfd* config)
 {
-    // check if the DM and configuration are valid
-    if (WARN_ON(!dm || !config)) {
+    if (WARN_ON_ONCE(!dm || !config)) {
         return -EINVAL;
     }
 
-    // deassign the eventfd
     if (config->flags & BAO_IRQFD_FLAG_DEASSIGN) {
         return bao_irqfd_deassign(dm, config);
     }
 
-    // assign the eventfd
     return bao_irqfd_assign(dm, config);
 }
 
@@ -297,14 +297,16 @@ int bao_irqfd_server_init(struct bao_dm* dm)
 {
     char name[BAO_NAME_MAX_LEN];
 
+    if (WARN_ON_ONCE(!dm)) {
+        return -EINVAL;
+    }
+
     mutex_init(&dm->irqfds_lock);
     INIT_LIST_HEAD(&dm->irqfds);
 
-    // create a new name for the irqfd server based on type and DM ID
     snprintf(name, sizeof(name), "bao-ioirqfds%u", dm->info.id);
 
-    // allocate a new workqueue for the irqfd
-    dm->irqfd_server = alloc_workqueue(name, 0, 0);
+    dm->irqfd_server = alloc_workqueue(name, WQ_UNBOUND | WQ_HIGHPRI, 0);
     if (!dm->irqfd_server) {
         return -ENOMEM;
     }
@@ -314,12 +316,18 @@ int bao_irqfd_server_init(struct bao_dm* dm)
 
 void bao_irqfd_server_destroy(struct bao_dm* dm)
 {
-    struct irqfd *irqfd, *next;
+    struct irqfd* irqfd;
+    struct irqfd* next;
 
-    // destroy the workqueue
-    destroy_workqueue(dm->irqfd_server);
+    if (WARN_ON_ONCE(!dm)) {
+        return;
+    }
+
+    if (dm->irqfd_server) {
+        destroy_workqueue(dm->irqfd_server);
+    }
+
     mutex_lock(&dm->irqfds_lock);
-    // shutdown all the irqfds
     list_for_each_entry_safe(irqfd, next, &dm->irqfds, list) bao_irqfd_shutdown(irqfd);
     mutex_unlock(&dm->irqfds_lock);
 }

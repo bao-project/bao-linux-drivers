@@ -1,419 +1,466 @@
-/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
+/* SPDX-License-Identifier: GPL-2.0 */
 /*
- * Provides the Bao Hypervisor IOCTLs and global structures
+ * Provides some definitions for the Bao Hypervisor modules
  *
  * Copyright (c) Bao Project and Contributors. All rights reserved.
  *
  * Authors:
- *	João Peixoto <joaopeixotooficial@gmail.com>
+ *	João Peixoto <joaopeixoto@osyx.tech>
+ *	José Martins <jose@osyx.tech>
+ *	David Cerdeira <davidmcerdeira@osyx.tech>
  */
 
-#ifndef _BAO_H
-#define _BAO_H
+#ifndef __BAO_DRV_H
+#define __BAO_DRV_H
 
-#include <linux/cdev.h>
-#include <linux/device.h>
-#include <linux/file.h>
 #include <linux/fs.h>
-#include <linux/interrupt.h>
-#include <linux/list.h>
-#include <linux/mutex.h>
-#include <linux/spinlock.h>
 #include <linux/types.h>
-#include <linux/uuid.h>
-#include <linux/wait.h>
 
-#define BAO_IO_WRITE       0x0
-#define BAO_IO_READ        0x1
-#define BAO_IO_ASK         0x2
-#define BAO_IO_NOTIFY      0x3
+#define BAO_NAME_MAX_LEN 16
+#define BAO_IO_MAX_DMS 16
 
-#define BAO_NAME_MAX_LEN   16
-#define BAO_IO_REQUEST_MAX 64
-#define BAO_IO_MAX_DMS     16
+#define BAO_IOEVENTFD_FLAG_DATAMATCH BIT(1)
+#define BAO_IOEVENTFD_FLAG_DEASSIGN BIT(2)
+#define BAO_IRQFD_FLAG_DEASSIGN 1U
+#define BAO_IO_CLIENT_DESTROYING 0U
+
+/* IPC through shared-memory hypercall ID */
+#define BAO_IPCSHMEM_HYPERCALL_ID 0x1
+
+/* Remote I/O Hypercall ID */
+#define BAO_REMIO_HYPERCALL_ID 0x2
 
 /**
- * Contains the specific parameters of a Bao VirtIO request
- * @dm_id: Device Model ID
- * @addr: Gives the MMIO register address that was accessed
- * @op: Write, Read, Ask or Notify operation
+ * struct bao_virtio_request - Parameters of a Bao VirtIO request
+ * @dm_id: Device model ID
+ * @addr: MMIO register address accessed
+ * @op: Operation type (WRITE = 0, READ, ASK, NOTIFY)
  * @value: Value to write or read
- * @access_width: Access width (VirtIO MMIO only allows 4-byte wide and alligned
- * accesses)
- * @request_id: Request ID
+ * @access_width: Access width (VirtIO MMIO supports 4-byte aligned accesses)
+ * @request_id: Request ID of the I/O request
  */
 struct bao_virtio_request {
-    __u64 dm_id;
-    __u64 addr;
-    __u64 op;
-    __u64 value;
-    __u64 access_width;
-    __u64 request_id;
+	__u64 dm_id;
+	__u64 addr;
+	__u64 op;
+	__u64 value;
+	__u64 access_width;
+	__u64 request_id;
 };
 
 /**
- * Contains the specific parameters of a ioeventfd request
- * @fd:		The fd of eventfd associated with a hsm_ioeventfd
- * @flags:	Logical-OR of BAO_IOEVENTFD_FLAG_*
- * @addr:	The start address of IO range of ioeventfd
- * @len:	The length of IO range of ioeventfd
- * @reserved:	Reserved and should be 0
- * @data:	Data for data matching
+ * struct bao_ioeventfd - Parameters of an ioeventfd request
+ * @fd: Eventfd file descriptor associated with the I/O request
+ * @flags: Logical OR of BAO_IOEVENTFD_FLAG_*
+ * @addr: Start address of the I/O range
+ * @len: Length of the I/O range
+ * @reserved: Reserved, must be 0
+ * @data: Data for matching (used if data matching is enabled)
  */
 struct bao_ioeventfd {
-    __u32 fd;
-    __u32 flags;
-    __u64 addr;
-    __u32 len;
-    __u32 reserved;
-    __u64 data;
+	__u32 fd;
+	__u32 flags;
+	__u64 addr;
+	__u32 len;
+	__u32 reserved;
+	__u64 data;
 };
 
 /**
- * Contains the specific parameters of a irqfd request
- * @fd: The file descriptor of the eventfd
- * @flags: The flags of the eventfd
+ * struct bao_irqfd - Parameters of an IRQFD request
+ * @fd: File descriptor of the eventfd
+ * @flags: Flags associated with the eventfd
  */
 struct bao_irqfd {
-    __s32 fd;
-    __u32 flags;
+	__s32 fd;
+	__u32 flags;
 };
 
 /**
- * Contains the specific parameters of a Bao DM
- * @id: The virtual ID of the DM
- * @shmem_addr: The base address of the shared memory
- * @shmem_size: The size of the shared memory
- * @irq: The IRQ number
- * @fd: The file descriptor of the DM
+ * struct bao_dm_info - Parameters of a Bao device model
+ * @id: Virtual ID of the DM
+ * @shmem_addr: Base address of the shared memory
+ * @shmem_size: Size of the shared memory
+ * @irq: IRQ number
+ * @fd: File descriptor of the DM
  */
 struct bao_dm_info {
-    __u32 id;
-    __u64 shmem_addr;
-    __u64 shmem_size;
-    __u32 irq;
-    __s32 fd;
+	__u32 id;
+	__u64 shmem_addr;
+	__u64 shmem_size;
+	__u32 irq;
+	__s32 fd;
 };
 
-/* The ioctl type, listed in Documentation/userspace-api/ioctl/ioctl-number.rst
+/*
+ * The ioctl type for Bao, documented in
+ * Documentation/userspace-api/ioctl/ioctl-number.rst
  */
-#define BAO_IOCTL_TYPE                0xA6
+#define BAO_IOCTL_TYPE 0xA6
 
 /*
- * Common IOCTL IDs definition for Bao userspace
- * Follows the convention of the Linux kernel, listed in
- * Documentation/driver-api/ioctl.rst
+ * Bao userspace IOCTL commands
+ * Follows Linux kernel convention, see Documentation/driver-api/ioctl.rst
  */
-#define BAO_IOCTL_DM_GET_INFO         _IOWR(BAO_IOCTL_TYPE, 0x01, struct bao_dm_info)
-#define BAO_IOCTL_IO_CLIENT_ATTACH    _IOWR(BAO_IOCTL_TYPE, 0x02, struct bao_virtio_request)
-#define BAO_IOCTL_IO_REQUEST_COMPLETE _IOW(BAO_IOCTL_TYPE, 0x03, struct bao_virtio_request)
-#define BAO_IOCTL_IOEVENTFD           _IOW(BAO_IOCTL_TYPE, 0x04, struct bao_ioeventfd)
-#define BAO_IOCTL_IRQFD               _IOW(BAO_IOCTL_TYPE, 0x05, struct bao_irqfd)
+#define BAO_IOCTL_DM_GET_INFO _IOWR(BAO_IOCTL_TYPE, 0x01, struct bao_dm_info)
+#define BAO_IOCTL_IO_CLIENT_ATTACH \
+	_IOWR(BAO_IOCTL_TYPE, 0x02, struct bao_virtio_request)
+#define BAO_IOCTL_IO_REQUEST_COMPLETE \
+	_IOW(BAO_IOCTL_TYPE, 0x03, struct bao_virtio_request)
+#define BAO_IOCTL_IOEVENTFD _IOW(BAO_IOCTL_TYPE, 0x04, struct bao_ioeventfd)
+#define BAO_IOCTL_IRQFD _IOW(BAO_IOCTL_TYPE, 0x05, struct bao_irqfd)
 
-#define BAO_IOEVENTFD_FLAG_DATAMATCH  (1 << 1)
-#define BAO_IOEVENTFD_FLAG_DEASSIGN   (1 << 2)
-#define BAO_IRQFD_FLAG_DEASSIGN       1U
-
-#define BAO_IO_CLIENT_DESTROYING      0U
-
-#define BAO_DM_FLAG_DESTROYING        0U
-#define BAO_DM_FLAG_CLEARING_IOREQ    1U
+/**
+ * struct bao_remio_hypercall_ctx - REMIO hypercall context
+ * @dm_id: Device model identifier
+ * @addr: Target address
+ * @op: Operation code
+ * @value: Value to read/write
+ * @access_width: Access width in bytes
+ * @request_id: Request identifier
+ * @npend_req: Number of pending requests
+ */
+struct bao_remio_hypercall_ctx {
+	u64 dm_id;
+	u64 addr;
+	u64 op;
+	u64 value;
+	u64 access_width;
+	u64 request_id;
+	u64 npend_req;
+};
 
 struct bao_dm;
 struct bao_io_client;
 
-typedef int (*bao_io_client_handler_t)(struct bao_io_client* client, struct bao_virtio_request* req);
+typedef int (*bao_io_client_handler_t)(struct bao_io_client *client,
+				       struct bao_virtio_request *req);
 
 /**
- * Bao I/O client
+ * enum bao_io_op - Bao hypervisor I/O operation types
+ * @BAO_IO_WRITE:   Write operation
+ * @BAO_IO_READ:    Read operation
+ * @BAO_IO_ASK:     Request operation information (e.g., MMIO address)
+ * @BAO_IO_NOTIFY:  Notify I/O completion
+ */
+enum bao_io_op {
+	BAO_IO_WRITE = 0,
+	BAO_IO_READ,
+	BAO_IO_ASK,
+	BAO_IO_NOTIFY,
+};
+
+/**
+ * struct bao_io_client - Bao I/O client
  * @name: Client name
- * @dm:	The DM that the client belongs to
+ * @dm: The DM that the client belongs to
  * @list: List node for this bao_io_client
- * @is_control:	If this client is the control client
+ * @is_control: If this client is the control client
  * @flags: Flags (BAO_IO_CLIENT_*)
- * @virtio_requests: Array of all I/O requests that are free to process
- * @virtio_requests_lock: Lock to protect virtio_requests list
- * @range_list:	I/O ranges
- * @range_lock:	Semaphore to protect range_list
- * @handler: I/O requests handler of this client
- * @thread:	The thread which executes the handler
- * @wq:	The wait queue for the handler thread parking
- * @priv: Data for the thread
+ * @virtio_requests: List of free I/O requests
+ * @range_list: I/O ranges
+ * @handler: I/O request handler for this client
+ * @thread: Kernel thread executing the handler
+ * @wq: Wait queue used for thread parking
+ * @priv: Private data for the handler
  */
 struct bao_io_client {
-    char name[BAO_NAME_MAX_LEN];
-    struct bao_dm* dm;
-    struct list_head list;
-    bool is_control;
-    unsigned long flags;
-    struct list_head virtio_requests;
-    struct mutex virtio_requests_lock;
-    struct list_head range_list;
-    struct rw_semaphore range_lock;
-    bao_io_client_handler_t handler;
-    struct task_struct* thread;
-    wait_queue_head_t wq;
-    void* priv;
+	char name[BAO_NAME_MAX_LEN];
+	struct bao_dm *dm;
+	struct list_head list;
+	bool is_control;
+	unsigned long flags;
+	struct list_head virtio_requests;
+
+	/* protects virtio_requests list */
+	struct mutex virtio_requests_lock;
+
+	struct list_head range_list;
+
+	/* protects range_list */
+	struct rw_semaphore range_lock;
+
+	bao_io_client_handler_t handler;
+	struct task_struct *thread;
+	wait_queue_head_t wq;
+	void *priv;
 };
 
 /**
- * Bao backend device model (DM)
+ * struct bao_dm - Bao backend device model (DM)
  * @list: Entry within global list of all DMs
  * @info: DM information (id, shmem_addr, shmem_size, irq, fd)
- * @shmem_base_addr: The base address of the shared memory (only used for
- * unmapping purposes)
- * @flags: Flags (BAO_IO_DISPATCHER_DM_*)
- * @ioeventfds: List to link all bao_ioeventfd
- * @ioeventfds_lock: Lock to protect ioeventfds list
- * @ioeventfd_client: Ioevenfd client
- * @irqfds: List to link all bao_irqfd
- * @irqfds_lock: Lock to protect irqfds list
- * @irqfd_server: Irqfd server
- * @io_clients_lock: Semaphore to protect io_clients
- * @io_clients:	List to link all bao_io_client
- * @control_client:	Control client
+ * @shmem_base_addr: The base address of the shared memory
+ * @ioeventfds: List of all ioeventfds
+ * @ioeventfd_client: Ioeventfd client
+ * @irqfds: List of all irqfds
+ * @irqfd_server: Workqueue responsible for irqfd handling
+ * @io_clients: List of all bao_io_client
+ * @control_client: Control client
+ * @refcount: Each open file holds a reference to the DM
  */
 struct bao_dm {
-    struct list_head list;
-    struct bao_dm_info info;
-    void* shmem_base_addr;
-    unsigned long flags;
-    struct list_head ioeventfds;
-    struct mutex ioeventfds_lock;
-    struct bao_io_client* ioeventfd_client;
-    struct list_head irqfds;
-    struct mutex irqfds_lock;
-    struct workqueue_struct* irqfd_server;
-    struct rw_semaphore io_clients_lock;
-    struct list_head io_clients;
-    struct bao_io_client* control_client;
+	struct list_head list;
+	struct bao_dm_info info;
+	void *shmem_base_addr;
+
+	struct list_head ioeventfds;
+
+	/* protects ioeventfds list */
+	struct mutex ioeventfds_lock;
+
+	struct bao_io_client *ioeventfd_client;
+
+	struct list_head irqfds;
+
+	/* protects irqfds list */
+	struct mutex irqfds_lock;
+
+	struct workqueue_struct *irqfd_server;
+
+	/* protects io_clients list */
+	struct rw_semaphore io_clients_lock;
+
+	struct list_head io_clients;
+	struct bao_io_client *control_client;
+
+	refcount_t refcount;
 };
 
 /**
- * Bao I/O request range
- * @list: List node for this range
- * @start: The start address of the range
- * @end: The end address of the range
- *
+ * struct bao_io_range - Represents a range of I/O addresses
+ * @list: List node for linking multiple ranges
+ * @start: Start address of the range
+ * @end: End address of the range (inclusive)
  */
 struct bao_io_range {
-    struct list_head list;
-    u64 start;
-    u64 end;
+	struct list_head list;
+	u64 start;
+	u64 end;
 };
 
+/* Global list of all Bao device models */
 extern struct list_head bao_dm_list;
+
+/* Lock protecting access to bao_dm_list */
 extern rwlock_t bao_dm_list_lock;
 
 /**
- * Create the backend DM
- * @info: The DM information (id, shmem_addr, shmem_size, irq, fd)
- * @return dm on success, NULL on error
+ * bao_dm_create - Create a backend device model (DM)
+ * @info: DM information (id, shmem_addr, shmem_size, irq, fd)
+ *
+ * Return: Pointer to the created DM on success, NULL on error.
  */
-struct bao_dm* bao_dm_create(struct bao_dm_info* info);
+struct bao_dm *bao_dm_create(struct bao_dm_info *info);
 
 /**
- * Destroy the backend DM
- * @dm: The DM to be destroyed
+ * bao_dm_destroy - Destroy a backend device model (DM)
+ * @dm: DM to be destroyed
  */
-void bao_dm_destroy(struct bao_dm* dm);
+void bao_dm_destroy(struct bao_dm *dm);
 
 /**
- * Get the DM information
- * @info: The DM information to be filled (id field contains the DM ID)
- * @return true on success, false on error
+ * bao_dm_get_info - Retrieve information of a DM
+ * @info: Structure to be filled; id field must contain the DM ID
+ *
+ * Return: True on success, false on error.
  */
-bool bao_dm_get_info(struct bao_dm_info* info);
+bool bao_dm_get_info(struct bao_dm_info *info);
 
 /**
- * DM ioctls handler
- * @filp: The open file pointer
- * @cmd: The ioctl command
- * @ioctl_param: The ioctl parameter
+ * bao_io_client_create - Create a backend I/O client
+ * @dm: DM this client belongs to
+ * @handler: I/O client handler for requests
+ * @data: Private data passed to the handler
+ * @is_control: True if this is the control client
+ * @name: Name of the I/O client
+ *
+ * Return: Pointer to the created I/O client, NULL on failure.
  */
-long bao_dm_ioctl(struct file* filp, unsigned int cmd, unsigned long ioctl_param);
+struct bao_io_client *bao_io_client_create(struct bao_dm *dm,
+					   bao_io_client_handler_t handler,
+					   void *data, bool is_control,
+					   const char *name);
 
 /**
- * Create an I/O client
- * @dm:	The DM that this client belongs to
- * @handler: The I/O client handler for the I/O requests
- * @data: Private data for the handler
- * @is_control:	If it is the control client
- * @name: The name of I/O client
+ * bao_io_clients_destroy - Destroy all I/O clients of a DM
+ * @dm: DM whose I/O clients are to be destroyed
  */
-struct bao_io_client* bao_io_client_create(struct bao_dm* dm, bao_io_client_handler_t handler,
-    void* data, bool is_control, const char* name);
+void bao_io_clients_destroy(struct bao_dm *dm);
 
 /**
- * Destroy the I/O clients of the DM
- * @dm: The DM that the I/O clients belong to
+ * bao_io_client_attach - Attach a thread to an I/O client
+ * @client: I/O client to attach
+ *
+ * The thread will wait for I/O requests on this client.
+ *
+ * Return: 0 on success, negative error code on failure.
  */
-void bao_io_clients_destroy(struct bao_dm* dm);
+int bao_io_client_attach(struct bao_io_client *client);
 
 /**
- * Attach the thread to the I/O client to wait for I/O requests
- * @client: The I/O client to handle the I/O request
+ * bao_io_client_range_add - Add an I/O range to monitor in a client
+ * @client: I/O client
+ * @start: Start address of the range
+ * @end: End address of the range (inclusive)
+ *
+ * Return: 0 on success, negative error code on failure.
  */
-int bao_io_client_attach(struct bao_io_client* client);
+int bao_io_client_range_add(struct bao_io_client *client, u64 start, u64 end);
 
 /**
- * Add an I/O range monitor into an I/O client
- * @client: The I/O client that the range will be added
- * @start: The start address of the range
- * @end: The end address of the range
+ * bao_io_client_range_del - Remove an I/O range from a client
+ * @client: I/O client
+ * @start: Start address of the range
+ * @end: End address of the range (inclusive)
  */
-int bao_io_client_range_add(struct bao_io_client* client, u64 start, u64 end);
+void bao_io_client_range_del(struct bao_io_client *client, u64 start, u64 end);
 
 /**
- * Delete an I/O range monitor from an I/O client
- * @client: The I/O client that the range will be deleted
- * @start: The start address of the range
- * @end: The end address of the range
+ * bao_io_client_request - Retrieve the oldest I/O request from a client
+ * @client: I/O client
+ * @req: Pointer to virtio request structure to fill
+ *
+ * Return: 0 on success, negative error code if no request is available.
  */
-void bao_io_client_range_del(struct bao_io_client* client, u64 start, u64 end);
+int bao_io_client_request(struct bao_io_client *client,
+			  struct bao_virtio_request *req);
 
 /**
- * Retrieve the oldest I/O request from the I/O client
- * @client: The I/O client
- * @req: The virtio request to be retrieved
- * @return 0 on success, <0 on failure
+ * bao_io_client_push_request - Push an I/O request into a client
+ * @client: I/O client
+ * @req: I/O request to push
+ *
+ * Return: True if a request was pushed, false otherwise.
  */
-int bao_io_client_request(struct bao_io_client* client, struct bao_virtio_request* req);
+bool bao_io_client_push_request(struct bao_io_client *client,
+				struct bao_virtio_request *req);
 
 /**
- * Push an I/O request into the I/O client request list
- * @client: The I/O Client that the I/O request belongs to
- * @req: The I/O request to be pushed
+ * bao_io_client_pop_request - Pop the oldest I/O request from a client
+ * @client: I/O client
+ * @req: Buffer to store the popped request
+ *
+ * Return: True if a request was popped, false if the list was empty.
  */
-void bao_io_client_push_request(struct bao_io_client* client, struct bao_virtio_request* req);
+bool bao_io_client_pop_request(struct bao_io_client *client,
+			       struct bao_virtio_request *req);
 
 /**
- * Pop an I/O request from the I/O client request list
- * @client: The I/O client that the I/O request belongs to
- * @req: The I/O request to be popped
- * @return true if the I/O request was popped, false otherwise
+ * bao_io_client_find - Find the I/O client for a given request
+ * @dm: DM that the I/O request belongs to
+ * @req: I/O request to locate
+ *
+ * Return: Pointer to the I/O client handling the request, NULL if none found.
  */
-bool bao_io_client_pop_request(struct bao_io_client* client, struct bao_virtio_request* req);
+struct bao_io_client *bao_io_client_find(struct bao_dm *dm,
+					 struct bao_virtio_request *req);
 
 /**
- * Find the I/O client that the I/O request belongs to
- * @dm: The DM that the I/O request belongs to
- * @req: The I/O request
- * @return The I/O client that the I/O request belongs to, or NULL if there is
- * no client
+ * bao_ioeventfd_client_init - Initialize the Ioeventfd client for a DM
+ * @dm: DM that the Ioeventfd client belongs to
+ *
+ * Return: 0 on success, negative error code on failure.
  */
-struct bao_io_client* bao_io_client_find(struct bao_dm* dm, struct bao_virtio_request* req);
+int bao_ioeventfd_client_init(struct bao_dm *dm);
 
 /**
- * Initialize the Ioeventfd client
- * @dm: The DM that the Ioeventfd client belongs to
+ * bao_ioeventfd_client_destroy - Destroy the Ioeventfd client for a DM
+ * @dm: DM that the Ioeventfd client belongs to
  */
-int bao_ioeventfd_client_init(struct bao_dm* dm);
+void bao_ioeventfd_client_destroy(struct bao_dm *dm);
 
 /**
- * Destroy the Ioeventfd client
- * @dm: The DM that the Ioeventfd client belongs to
+ * bao_ioeventfd_client_config - Configure an Ioeventfd client
+ * @dm: DM that the Ioeventfd client belongs to
+ * @config: Ioeventfd configuration to apply
+ *
+ * Return: 0 on success, negative error code on failure.
  */
-void bao_ioeventfd_client_destroy(struct bao_dm* dm);
+int bao_ioeventfd_client_config(struct bao_dm *dm,
+				struct bao_ioeventfd *config);
 
 /**
- * Configure the Ioeventfd client
- * @dm: The DM that the Ioeventfd client belongs to
- * @config: The ioeventfd configuration
+ * bao_irqfd_server_init - Initialize the Irqfd server for a DM
+ * @dm: DM that the Irqfd server belongs to
+ *
+ * Return: 0 on success, negative error code on failure.
  */
-int bao_ioeventfd_client_config(struct bao_dm* dm, struct bao_ioeventfd* config);
+int bao_irqfd_server_init(struct bao_dm *dm);
 
 /**
- * Initialize the Irqfd server
- * @dm: The DM that the Irqfd server belongs to
+ * bao_irqfd_server_destroy - Destroy the Irqfd server for a DM
+ * @dm: DM that the Irqfd server belongs to
  */
-int bao_irqfd_server_init(struct bao_dm* dm);
+void bao_irqfd_server_destroy(struct bao_dm *dm);
 
 /**
- * Destroy the Irqfd server
- * @dm: The DM that the Irqfd server belongs to
+ * bao_irqfd_server_config - Configure an Irqfd server
+ * @dm: DM that the Irqfd server belongs to
+ * @config: Irqfd configuration to apply
+ *
+ * Return: 0 on success, negative error code on failure.
  */
-void bao_irqfd_server_destroy(struct bao_dm* dm);
+int bao_irqfd_server_config(struct bao_dm *dm, struct bao_irqfd *config);
 
 /**
- * Configure the Irqfd server
- * @dm: The DM that the Irqfd server belongs to
- * @config: The irqfd configuration
+ * bao_io_dispatcher_init - Initialize the I/O Dispatcher for a DM
+ * @dm: DM to initialize on the I/O Dispatcher
+ *
+ * Return: 0 on success, negative error code on failure.
  */
-int bao_irqfd_server_config(struct bao_dm* dm, struct bao_irqfd* config);
+int bao_io_dispatcher_init(struct bao_dm *dm);
 
 /**
- * Initialize the I/O Dispatcher
- * @dm: The DM to be initialized on the I/O Dispatcher
+ * bao_io_dispatcher_destroy - Destroy the I/O Dispatcher for a DM
+ * @dm: DM to destroy on the I/O Dispatcher
  */
-int bao_io_dispatcher_init(struct bao_dm* dm);
+void bao_io_dispatcher_destroy(struct bao_dm *dm);
 
 /**
- * Destroy the I/O Dispatcher
- * @dm: The DM to be destroyed on the I/O Dispatcher
+ * bao_dispatch_io - Acquire and dispatch I/O requests from the Bao Hypervisor
+ * @dm: DM whose I/O clients will handle the requests
+ *
+ * Return: 0 on success, negative error code on failure.
  */
-void bao_io_dispatcher_destroy(struct bao_dm* dm);
+int bao_dispatch_io(struct bao_dm *dm);
 
 /**
- * Setup the I/O Dispatcher
+ * bao_io_dispatcher_pause - Pause the I/O Dispatcher for a DM
+ * @dm: DM to pause
  */
-int bao_io_dispatcher_setup(void);
+void bao_io_dispatcher_pause(struct bao_dm *dm);
 
 /**
- * Remove the I/O Dispatcher
+ * bao_io_dispatcher_resume - Resume the I/O Dispatcher for a DM
+ * @dm: DM to resume
  */
-void bao_io_dispatcher_remove(void);
+void bao_io_dispatcher_resume(struct bao_dm *dm);
 
 /**
- * Acquires the I/O requests from the Bao Hypervisor and dispatches them to the
- * respective I/O client
- * @dm: The DM that the I/O clients belongs to
- * @return: 0 on success, <0 on failure
+ * bao_intc_init - Register the interrupt controller for a DM
+ * @dm: DM that the interrupt controller belongs to
+ *
+ * Return: 0 on success, negative error code on failure.
  */
-int bao_dispatch_io(struct bao_dm* dm);
+int bao_intc_init(struct bao_dm *dm);
 
 /**
- * Pause the I/O Dispatcher
- * @dm: The DM that will be paused
+ * bao_intc_destroy - Unregister the interrupt controller for a DM
+ * @dm: DM that the interrupt controller belongs to
  */
-void bao_io_dispatcher_pause(struct bao_dm* dm);
+void bao_intc_destroy(struct bao_dm *dm);
 
 /**
- * Resume the I/O Dispatcher
- * @dm: The DM that will be resumed
+ * bao_intc_setup_handler - Setup the interrupt controller handler
+ * @handler: Function pointer to the interrupt handler
+ * @dm: DM that the interrupt controller belongs to
  */
-void bao_io_dispatcher_resume(struct bao_dm* dm);
+void bao_intc_setup_handler(void (*handler)(struct bao_dm *dm));
 
 /**
- * Register the interrupt controller
- * @dm: The DM that the interrupt controller belongs to
- */
-int bao_intc_register(struct bao_dm* dm);
-
-/**
- * Unregister the interrupt controller
- * @dm: The DM that the interrupt controller belongs to
- */
-void bao_intc_unregister(struct bao_dm* dm);
-
-/**
- * Setup the interrupt controller handler
- * @handler: The interrupt handler
- * @dm: The DM that the interrupt controller belongs to
- */
-void bao_intc_setup_handler(void (*handler)(struct bao_dm* dm));
-
-/**
- * Remove the interrupt controller handler
+ * bao_intc_remove_handler - Remove the interrupt controller handler
  */
 void bao_intc_remove_handler(void);
 
-/**
- * I/O Dispatcher kernel module ioctls handler
- * @filp: The open file pointer
- * @cmd: The ioctl command
- * @ioctl_param: The ioctl parameter
- */
-long bao_io_dispatcher_driver_ioctl(struct file* filp, unsigned int cmd, unsigned long ioctl_param);
-
-#endif /* _BAO_H */
+#endif /* __BAO_DRV_H */
