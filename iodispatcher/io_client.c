@@ -303,11 +303,6 @@ struct bao_io_client* bao_io_client_create(struct bao_dm* dm, bao_io_client_hand
     list_add(&client->list, &dm->io_clients);
     up_write(&dm->io_clients_lock);
 
-    if (is_control) {
-        while (bao_dispatch_io(dm) > 0)
-            ;
-    }
-
     return client;
 }
 
