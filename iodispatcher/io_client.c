@@ -279,6 +279,7 @@ struct bao_io_client* bao_io_client_create(struct bao_dm* dm, bao_io_client_hand
     }
 
     INIT_LIST_HEAD(&client->virtio_requests);
+    mutex_init(&client->virtio_requests_lock);
     init_rwsem(&client->range_lock);
     INIT_LIST_HEAD(&client->range_list);
     init_waitqueue_head(&client->wq);

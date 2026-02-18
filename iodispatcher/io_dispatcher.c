@@ -63,6 +63,8 @@ int bao_dispatch_io(struct bao_dm* dm)
     ctx.addr = 0;
     ctx.value = 0;
     ctx.request_id = 0;
+    ctx.access_width = 0;
+    ctx.npend_req = 0;
 
     if (bao_remio_hypercall(&ctx)) {
         return -EFAULT;
