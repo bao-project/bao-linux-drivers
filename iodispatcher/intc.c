@@ -10,8 +10,8 @@
  *	David Cerdeira <davidmcerdeira@osyx.tech>
  */
 
+#include <bao.h>
 #include <linux/interrupt.h>
-#include "bao.h"
 
 /* Top-level handler registered by the Bao interrupt controller */
 static void (*bao_intc_handler)(struct bao_dm* dm);

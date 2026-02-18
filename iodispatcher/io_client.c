@@ -10,9 +10,9 @@
  *	David Cerdeira <davidmcerdeira@osyx.tech>
  */
 
+#include <bao.h>
+#include <hypercall.h>
 #include <linux/kthread.h>
-#include "bao.h"
-#include "hypercall.h"
 
 /**
  * struct bao_io_request - Bao I/O request structure

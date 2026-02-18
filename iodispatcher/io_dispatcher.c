@@ -10,8 +10,8 @@
  *	David Cerdeira <davidmcerdeira@osyx.tech>
  */
 
-#include "bao.h"
-#include "hypercall.h"
+#include <bao.h>
+#include <hypercall.h>
 
 /**
  * struct bao_io_dispatcher_work - Work item for I/O dispatching

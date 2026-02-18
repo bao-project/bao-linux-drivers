@@ -10,12 +10,12 @@
  *	David Cerdeira <davidmcerdeira@osyx.tech>
  */
 
-#include "bao.h"
+#include <bao.h>
+#include <hypercall.h>
 #include <linux/io.h>
 #include <linux/mm.h>
 #include <linux/anon_inodes.h>
 #include <linux/file.h>
-#include "hypercall.h"
 
 /*
  * List of all backend device models (DMs)

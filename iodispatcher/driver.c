@@ -5,10 +5,10 @@
  * Copyright (c) Bao Project and Contributors. All rights reserved.
  */
 
+#include <bao.h>
 #include <linux/platform_device.h>
 #include <linux/of_irq.h>
 #include <linux/miscdevice.h>
-#include "bao.h"
 
 struct bao_iodispatcher_drv {
     struct miscdevice miscdev;
