@@ -132,8 +132,7 @@ bao_remio_hypercall(struct bao_remio_hypercall_ctx *ctx)
 	asm volatile("ecall"
 		     : "+r"(a0), "+r"(a1), "+r"(a2), "+r"(a3), "+r"(a4),
 		       "+r"(a5), "+r"(a6), "+r"(a7)
-		     : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5),
-		       "r"(a6), "r"(a7)
+		     :
 		     : "memory");
 
 	ctx->addr = a2;
