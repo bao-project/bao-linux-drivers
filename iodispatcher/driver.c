@@ -144,7 +144,7 @@ err_unregister_dms:
     return ret;
 }
 
-static void bao_io_dispatcher_driver_remove(struct platform_device* pdev)
+static int bao_io_dispatcher_driver_remove(struct platform_device* pdev)
 {
     struct bao_iodispatcher_drv* drv = platform_get_drvdata(pdev);
     struct bao_dm* dm;
@@ -159,6 +159,8 @@ static void bao_io_dispatcher_driver_remove(struct platform_device* pdev)
         bao_intc_destroy(dm);
         bao_dm_destroy(dm);
     }
+
+    return 0;
 }
 
 static const struct of_device_id bao_io_dispatcher_driver_dt_ids[] = {

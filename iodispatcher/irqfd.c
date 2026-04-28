@@ -199,12 +199,12 @@ static int bao_irqfd_assign(struct bao_dm* dm, struct bao_irqfd* args)
     INIT_WORK(&irqfd->shutdown, irqfd_shutdown_work);
 
     f = fdget(args->fd);
-    if (!fd_file(f)) {
+    if (!f.file) {
         ret = -EBADF;
         goto out_free_irqfd;
     }
 
-    eventfd = eventfd_ctx_fileget(fd_file(f));
+    eventfd = eventfd_ctx_fileget(f.file);
     if (IS_ERR(eventfd)) {
         ret = PTR_ERR(eventfd);
         goto out_fdput;
@@ -226,7 +226,7 @@ static int bao_irqfd_assign(struct bao_dm* dm, struct bao_irqfd* args)
     list_add_tail(&irqfd->list, &dm->irqfds);
     mutex_unlock(&dm->irqfds_lock);
 
-    events = vfs_poll(fd_file(f), &irqfd->pt);
+    events = vfs_poll(f.file, &irqfd->pt);
     if (events & EPOLLIN) {
         bao_irqfd_inject(dm->info.id);
     }
