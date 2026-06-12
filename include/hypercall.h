@@ -142,7 +142,7 @@ bao_remio_hypercall(struct bao_remio_hypercall_ctx *ctx)
 	ctx->request_id = a6;
 	ctx->npend_req = a7;
 
-	return a0;
+	return a1;
 }
 #endif
 
