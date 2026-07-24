@@ -303,6 +303,12 @@ struct bao_io_client* bao_io_client_create(struct bao_dm* dm, bao_io_client_hand
     list_add(&client->list, &dm->io_clients);
     up_write(&dm->io_clients_lock);
 
+    /* Drain I/O requests raised before this client attached: their
+     * new-request notification may have been lost while the dispatcher's
+     * interrupt source was not yet configured.
+     */
+    bao_io_dispatcher_resume(dm);
+
     return client;
 }
 

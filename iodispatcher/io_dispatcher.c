@@ -12,6 +12,7 @@
 
 #include <bao.h>
 #include <hypercall.h>
+#include <linux/interrupt.h>
 
 /**
  * struct bao_io_dispatcher_work - Work item for I/O dispatching
@@ -158,6 +159,13 @@ void bao_io_dispatcher_resume(struct bao_dm* dm)
     }
 
     bao_intc_setup_handler(io_dispatcher_intc_handler);
+
+    /* Quash any notification latched while the dispatcher was not looking;
+     * the requests it announced are drained by the dispatch pass queued
+     * below. Clearing before asking preserves notifications for requests
+     * arriving concurrently.
+     */
+    irq_set_irqchip_state(dm->info.irq, IRQCHIP_STATE_PENDING, false);
 
     queue_work(bao_io_dispatcher_wq[dm->info.id], &io_dispatcher_work[dm->info.id].work);
 }
