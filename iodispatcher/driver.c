@@ -3,220 +3,161 @@
  * Bao Hypervisor I/O Dispatcher Kernel Driver
  *
  * Copyright (c) Bao Project and Contributors. All rights reserved.
- *
- * Authors:
- *	João Peixoto <joaopeixotooficial@gmail.com>
  */
 
-#include "bao.h"
-#include <asm/io.h>
-#include <linux/cdev.h>
-#include <linux/device.h>
-#include <linux/fs.h>
-#include <linux/io.h>
-#include <linux/ioport.h>
-#include <linux/kernel.h>
-#include <linux/mm.h>
-#include <linux/module.h>
-#include <linux/mutex.h>
-#include <linux/of.h>
-#include <linux/of_irq.h>
+#include <bao.h>
 #include <linux/platform_device.h>
-#include <linux/poll.h>
-#include <linux/spinlock.h>
-#include <linux/types.h>
-#include <linux/uaccess.h>
-#include <linux/wait.h>
+#include <linux/of_irq.h>
+#include <linux/miscdevice.h>
 
-#define DEV_NAME "bao-io-dispatcher"
-
-static dev_t bao_iodispatcher_devt;
-struct class* bao_iodispatcher_cl;
-
-/**
- * Bao I/O Dispatcher driver structure
- * @cdev: The character device
- * @dev: The device
- */
 struct bao_iodispatcher_drv {
-    struct cdev cdev;
-    struct device* dev;
+    struct miscdevice miscdev;
 };
 
-/**
- * Open the I/O Dispatcher device
- * @inode: The inode of the I/O Dispatcher
- * @filp: The file pointer of the I/O Dispatcher
- */
-static int bao_io_dispatcher_driver_open_fops(struct inode* inode, struct file* filp)
+static int bao_io_dispatcher_driver_open(struct inode* inode, struct file* filp)
 {
-    struct bao_iodispatcher_drv* bao_iodispatcher_drv =
-        container_of(inode->i_cdev, struct bao_iodispatcher_drv, cdev);
-    filp->private_data = bao_iodispatcher_drv;
+    struct miscdevice* misc = filp->private_data;
+    struct bao_iodispatcher_drv* drv;
 
-    kobject_get(&bao_iodispatcher_drv->dev->kobj);
+    drv = container_of(misc, struct bao_iodispatcher_drv, miscdev);
+    filp->private_data = drv;
 
     return 0;
 }
 
-/**
- * Release the I/O Dispatcher device
- * @inode: The inode of the I/O Dispatcher
- * @filp: The file pointer of the I/O Dispatcher
- */
-static int bao_io_dispatcher_driver_release_fops(struct inode* inode, struct file* filp)
+static int bao_io_dispatcher_driver_release(struct inode* inode, struct file* filp)
 {
-    struct bao_iodispatcher_drv* bao_iodispatcher_drv =
-        container_of(inode->i_cdev, struct bao_iodispatcher_drv, cdev);
     filp->private_data = NULL;
-
-    kobject_put(&bao_iodispatcher_drv->dev->kobj);
-
     return 0;
 }
 
-static long bao_io_dispatcher_driver_ioctl_fops(struct file* filp, unsigned int cmd,
-    unsigned long ioctl_param)
+static long bao_io_dispatcher_driver_ioctl(struct file* filp, unsigned int cmd, unsigned long arg)
 {
-    return bao_io_dispatcher_driver_ioctl(filp, cmd, ioctl_param);
+    struct bao_dm_info* info;
+
+    switch (cmd) {
+        case BAO_IOCTL_DM_GET_INFO:
+            info = memdup_user((void __user*)arg, sizeof(*info));
+            if (IS_ERR(info)) {
+                return PTR_ERR(info);
+            }
+
+            if (!bao_dm_get_info(info)) {
+                kfree(info);
+                return -ENOENT;
+            }
+
+            if (copy_to_user((void __user*)arg, info, sizeof(*info))) {
+                kfree(info);
+                return -EFAULT;
+            }
+
+            kfree(info);
+            return 0;
+
+        default:
+            return -ENOTTY;
+    }
 }
 
-static struct file_operations bao_io_dispatcher_driver_fops = {
+static const struct file_operations bao_io_dispatcher_driver_fops = {
     .owner = THIS_MODULE,
-    .open = bao_io_dispatcher_driver_open_fops,
-    .release = bao_io_dispatcher_driver_release_fops,
-    .unlocked_ioctl = bao_io_dispatcher_driver_ioctl_fops,
+    .open = bao_io_dispatcher_driver_open,
+    .release = bao_io_dispatcher_driver_release,
+    .unlocked_ioctl = bao_io_dispatcher_driver_ioctl,
 };
 
-/**
- * Register the driver with the kernel
- * @pdev: Platform device pointer
- */
-static int bao_io_dispatcher_driver_register(struct platform_device* pdev)
+static int bao_io_dispatcher_driver_probe(struct platform_device* pdev)
 {
-    int ret, irq;
-    struct module* owner = THIS_MODULE;
-    struct resource* r;
-    dev_t devt;
-    resource_size_t reg_size;
-    struct bao_iodispatcher_drv* bao_io_dispatcher_drv;
+    struct device* dev = &pdev->dev;
+    struct bao_iodispatcher_drv* drv;
     struct bao_dm* dm;
     struct bao_dm_info dm_info;
+    struct resource* r;
+    int ret;
+    int irq;
+    int i;
+    resource_size_t reg_size;
 
-    // setup the I/O Dispatcher system
-    ret = bao_io_dispatcher_setup();
-    if (ret) {
-        dev_err(&pdev->dev, "setup I/O Dispatcher failed!\n");
-        return ret;
+    drv = devm_kzalloc(dev, sizeof(*drv), GFP_KERNEL);
+    if (!drv) {
+        return -ENOMEM;
     }
 
-    // allocate memory for the Bao I/O Dispatcher structure
-    bao_io_dispatcher_drv =
-        devm_kzalloc(&pdev->dev, sizeof(struct bao_iodispatcher_drv), GFP_KERNEL);
-
-    if (bao_io_dispatcher_drv == NULL) {
-        ret = -ENOMEM;
-        goto err_io_dispatcher;
-    }
-
-    for (int i = 0; i < BAO_IO_MAX_DMS; i++) {
-        // get the memory region from the device tree
+    for (i = 0; i < BAO_IO_MAX_DMS; i++) {
         r = platform_get_resource(pdev, IORESOURCE_MEM, i);
         if (!r) {
             break;
         }
 
-        // get the interrupt number from the device tree
         irq = platform_get_irq(pdev, i);
         if (irq < 0) {
-            dev_err(&pdev->dev, "Failed to read interrupt number at index %d\n", i);
+            dev_err(dev, "failed to get IRQ at index %d\n", i);
             ret = irq;
-            goto err_io_dispatcher;
+            goto err_unregister_dms;
         }
 
-        // get the memory region size
         reg_size = resource_size(r);
 
-        // set the device model information
         dm_info.id = i;
         dm_info.shmem_addr = (unsigned long)r->start;
         dm_info.shmem_size = (unsigned long)reg_size;
         dm_info.irq = irq;
         dm_info.fd = 0;
 
-        // create the device model
         dm = bao_dm_create(&dm_info);
-        if (dm == NULL) {
-            dev_err(&pdev->dev, "failed to create Bao I/O Dispatcher device model %d\n", i);
-            ret = -ENOMEM;
-            goto err_io_dispatcher;
+        if (!dm) {
+            dev_err(dev, "failed to create Bao DM %d\n", i);
+            ret = -EINVAL;
+            goto err_unregister_dms;
         }
 
-        // register the interrupt
-        ret = bao_intc_register(dm);
+        ret = bao_intc_init(dm);
         if (ret) {
-            dev_err(&pdev->dev, "failed to register interrupt %d\n", irq);
+            dev_err(dev, "failed to register interrupt %d\n", irq);
             goto err_unregister_dms;
         }
     }
 
-    cdev_init(&bao_io_dispatcher_drv->cdev, &bao_io_dispatcher_driver_fops);
-    bao_io_dispatcher_drv->cdev.owner = owner;
+    drv->miscdev.minor = MISC_DYNAMIC_MINOR;
+    drv->miscdev.name = "bao-io-dispatcher";
+    drv->miscdev.fops = &bao_io_dispatcher_driver_fops;
+    drv->miscdev.parent = dev;
 
-    devt = MKDEV(MAJOR(bao_iodispatcher_devt), 0);
-    ret = cdev_add(&bao_io_dispatcher_drv->cdev, devt, 1);
+    ret = misc_register(&drv->miscdev);
     if (ret) {
+        dev_err(dev, "failed to register misc device: %d\n", ret);
         goto err_unregister_irqs;
     }
 
-    bao_io_dispatcher_drv->dev =
-        device_create(bao_iodispatcher_cl, &pdev->dev, devt, bao_io_dispatcher_drv, DEV_NAME);
-    if (IS_ERR(bao_io_dispatcher_drv->dev)) {
-        ret = PTR_ERR(bao_io_dispatcher_drv->dev);
-        goto err_cdev;
-    }
-    dev_set_drvdata(bao_io_dispatcher_drv->dev, bao_io_dispatcher_drv);
+    platform_set_drvdata(pdev, drv);
 
+    dev_info(dev, "Bao I/O dispatcher device registered\n");
     return 0;
 
-err_cdev:
-    cdev_del(&bao_io_dispatcher_drv->cdev);
-err_unregister_irqs: {
-    list_for_each_entry(dm, &bao_dm_list, list)
-    {
-        bao_intc_unregister(dm);
-    }
-}
-err_unregister_dms: {
-    list_for_each_entry(dm, &bao_dm_list, list)
-    {
-        bao_dm_destroy(dm);
-    }
-}
-err_io_dispatcher:
-    bao_io_dispatcher_remove();
+err_unregister_irqs:
+    list_for_each_entry(dm, &bao_dm_list, list) bao_intc_destroy(dm);
 
-    dev_err(&pdev->dev, "failed initialization\n");
+err_unregister_dms:
+    list_for_each_entry(dm, &bao_dm_list, list) bao_dm_destroy(dm);
+
     return ret;
 }
 
-/**
- * Unregister the driver from the kernel
- * @pdev: Platform device pointer
- */
-static void bao_io_dispatcher_driver_unregister(struct platform_device* pdev)
+static void bao_io_dispatcher_driver_remove(struct platform_device* pdev)
 {
+    struct bao_iodispatcher_drv* drv = platform_get_drvdata(pdev);
     struct bao_dm* dm;
+    struct bao_dm* tmp;
 
-    // remove the I/O Dispatcher system
-    bao_io_dispatcher_remove();
+    if (drv) {
+        misc_deregister(&drv->miscdev);
+    }
 
-    list_for_each_entry(dm, &bao_dm_list, list)
+    list_for_each_entry_safe(dm, tmp, &bao_dm_list, list)
     {
-        // destroy the device model
+        bao_intc_destroy(dm);
         bao_dm_destroy(dm);
-        // unregister the interrupt
-        bao_intc_unregister(dm);
     }
 }
 
@@ -226,45 +167,18 @@ static const struct of_device_id bao_io_dispatcher_driver_dt_ids[] = {
 MODULE_DEVICE_TABLE(of, bao_io_dispatcher_driver_dt_ids);
 
 static struct platform_driver bao_io_dispatcher_driver = {
-    .probe = bao_io_dispatcher_driver_register,
-    .remove = bao_io_dispatcher_driver_unregister,
-    .driver =
-        {
-            .name = "bao-io-dispatcher",
-            .of_match_table = of_match_ptr(bao_io_dispatcher_driver_dt_ids),
-            .owner = THIS_MODULE,
-        },
+	.probe = bao_io_dispatcher_driver_probe,
+	.remove = bao_io_dispatcher_driver_remove,
+	.driver = {
+		.name = "bao-io-dispatcher",
+		.of_match_table = bao_io_dispatcher_driver_dt_ids,
+	},
 };
 
-static int __init bao_io_dispatcher_driver_init(void)
-{
-    int ret;
+module_platform_driver(bao_io_dispatcher_driver);
 
-    if ((bao_iodispatcher_cl = class_create(DEV_NAME)) == NULL) {
-        ret = -1;
-        pr_err("unable to class_create " DEV_NAME " device\n");
-        return ret;
-    }
-
-    ret = alloc_chrdev_region(&bao_iodispatcher_devt, 0, BAO_IO_MAX_DMS, DEV_NAME);
-    if (ret < 0) {
-        pr_err("unable to alloc_chrdev_region " DEV_NAME " device\n");
-        return ret;
-    }
-
-    return platform_driver_register(&bao_io_dispatcher_driver);
-}
-
-static void __exit bao_io_dispatcher_driver_exit(void)
-{
-    platform_driver_unregister(&bao_io_dispatcher_driver);
-    unregister_chrdev(bao_iodispatcher_devt, DEV_NAME);
-    class_destroy(bao_iodispatcher_cl);
-}
-
-module_init(bao_io_dispatcher_driver_init);
-module_exit(bao_io_dispatcher_driver_exit);
-
-MODULE_AUTHOR("João Peixoto <joaopeixotooficial@gmail.com>");
 MODULE_LICENSE("GPL");
+MODULE_AUTHOR("João Peixoto <joaopeixoto@osyx.tech>");
+MODULE_AUTHOR("David Cerdeira <davidmcerdeira@osyx.tech>");
+MODULE_AUTHOR("José Martins <jose@osyx.tech>");
 MODULE_DESCRIPTION("Bao Hypervisor I/O Dispatcher Kernel Driver");

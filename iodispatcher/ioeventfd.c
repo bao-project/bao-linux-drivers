@@ -5,20 +5,24 @@
  * Copyright (c) Bao Project and Contributors. All rights reserved.
  *
  * Authors:
- *	João Peixoto <joaopeixotooficial@gmail.com>
+ *	João Peixoto <joaopeixoto@osyx.tech>
+ *	José Martins <jose@osyx.tech>
+ *	David Cerdeira <davidmcerdeira@osyx.tech>
  */
 
-#include "bao.h"
+#include <bao.h>
 #include <linux/eventfd.h>
 
 /**
- * Properties of a ioeventfd
- * @list: List node of the ioeventfd
- * @eventfd: Eventfd of the ioeventfd
- * @addr: Address of I/O range
- * @data: Data for matching
- * @length:	Length of I/O range
- * @wildcard: Data matching or not
+ * struct ioeventfd - Properties of an I/O eventfd
+ * @list: List node linking this ioeventfd
+ * @eventfd: Associated eventfd context
+ * @addr: Start address of the I/O range
+ * @data: Data used for matching (if not wildcard)
+ * @length: Length of the I/O range
+ * @wildcard: True if data matching is not required
+ *
+ * Represents an I/O eventfd registered for a Bao device model.
  */
 struct ioeventfd {
     struct list_head list;
@@ -30,40 +34,40 @@ struct ioeventfd {
 };
 
 /**
- * Shutdown the ioeventfd
- * @dm:	The DM that the ioeventfd belongs to
- * @p: The ioeventfd to shutdown
+ * bao_ioeventfd_shutdown - Release and remove an ioeventfd
+ * @dm: Bao device model owning the ioeventfd
+ * @p: Ioeventfd to shut down
  */
 static void bao_ioeventfd_shutdown(struct bao_dm* dm, struct ioeventfd* p)
 {
     lockdep_assert_held(&dm->ioeventfds_lock);
 
-    // unregister the ioeventfd
+    if (WARN_ON_ONCE(!p)) {
+        return;
+    }
+
     eventfd_ctx_put(p->eventfd);
-    // remove the ioeventfd from the list
     list_del(&p->list);
-    // free the ioeventfd
     kfree(p);
 }
 
 /**
- * Check if the configuration of ioeventfd is valid
- * @config: The configuration of ioeventfd
- * @return: bool
+ * bao_ioeventfd_config_valid - Validate ioeventfd configuration
+ * @config: Ioeventfd configuration
+ *
+ * Return: True if config is non-NULL, address+length does not wrap,
+ * and length is 1, 2, 4, or 8 bytes.
  */
 static bool bao_ioeventfd_config_valid(struct bao_ioeventfd* config)
 {
-    // check if the configuration is valid
-    if (!config) {
+    if (WARN_ON_ONCE(!config)) {
         return false;
     }
 
-    // check for overflow
     if (config->addr + config->len < config->addr) {
         return false;
     }
 
-    // vhost supports 1, 2, 4 and 8 bytes access
     if (!(config->len == 1 || config->len == 2 || config->len == 4 || config->len == 8)) {
         return false;
     }
@@ -72,10 +76,12 @@ static bool bao_ioeventfd_config_valid(struct bao_ioeventfd* config)
 }
 
 /**
- * Check if the ioeventfd is conflict with other ioeventfds
- * @dm: The DM that the ioeventfd belongs to
- * @ioeventfd: The ioeventfd to check
- * @return: bool
+ * bao_ioeventfd_is_conflict - Check if an ioeventfd conflicts with existing ones
+ * @dm: Bao device model
+ * @ioeventfd: Ioeventfd to check
+ *
+ * Return: True if an existing ioeventfd matches address, eventfd,
+ * and optionally data.
  */
 static bool bao_ioeventfd_is_conflict(struct bao_dm* dm, struct ioeventfd* ioeventfd)
 {
@@ -83,27 +89,39 @@ static bool bao_ioeventfd_is_conflict(struct bao_dm* dm, struct ioeventfd* ioeve
 
     lockdep_assert_held(&dm->ioeventfds_lock);
 
-    // either one is wildcard, the data matching will be skipped
-    list_for_each_entry(p, &dm->ioeventfds, list) if (p->eventfd == ioeventfd->eventfd &&
-        p->addr == ioeventfd->addr &&
-        (p->wildcard || ioeventfd->wildcard || p->data == ioeventfd->data)) return true;
+    if (WARN_ON_ONCE(!dm || !ioeventfd)) {
+        return true;
+    }
+
+    list_for_each_entry(p, &dm->ioeventfds, list)
+    {
+        if (p->eventfd == ioeventfd->eventfd && p->addr == ioeventfd->addr &&
+            (p->wildcard || ioeventfd->wildcard || p->data == ioeventfd->data)) {
+            return true;
+        }
+    }
 
     return false;
 }
 
 /**
- * Return the matched ioeventfd
- * @dm: The DM to check
- * @addr: The address of I/O request
- * @data: The data of I/O request
- * @len: The length of I/O request
- * @return: The matched ioeventfd or NULL
+ * bao_ioeventfd_match - Find ioeventfd matching an I/O request
+ * @dm: Bao device model
+ * @addr: I/O request address
+ * @data: I/O request data
+ * @len: I/O request length
+ *
+ * Return: The matching ioeventfd, NULL if none matches.
  */
 static struct ioeventfd* bao_ioeventfd_match(struct bao_dm* dm, u64 addr, u64 data, int len)
 {
-    struct ioeventfd* p = NULL;
+    struct ioeventfd* p;
 
     lockdep_assert_held(&dm->ioeventfds_lock);
+
+    if (WARN_ON_ONCE(!dm)) {
+        return NULL;
+    }
 
     list_for_each_entry(p, &dm->ioeventfds, list)
     {
@@ -116,9 +134,17 @@ static struct ioeventfd* bao_ioeventfd_match(struct bao_dm* dm, u64 addr, u64 da
 }
 
 /**
- * Assign an eventfd to a DM and create a ioeventfd associated with the eventfd
- * @dm:	The DM to assign the eventfd to
- * @config:	The configuration of the eventfd
+ * bao_ioeventfd_assign - Assign and create an eventfd for a DM
+ * @dm: Bao device model to assign the eventfd to
+ * @config: Configuration of the eventfd to create
+ *
+ * Creates a new ioeventfd associated with the given eventfd and
+ * adds it to the Bao DM. Validates the configuration, checks for
+ * conflicts with existing ioeventfds, and registers the corresponding
+ * I/O client address range. Supports optional data matching for
+ * virtio 1.0 notifications; if not set, wildcard matching is used.
+ *
+ * Return: 0 on success, a negative error code on failure
  */
 static int bao_ioeventfd_assign(struct bao_dm* dm, struct bao_ioeventfd* config)
 {
@@ -126,126 +152,122 @@ static int bao_ioeventfd_assign(struct bao_dm* dm, struct bao_ioeventfd* config)
     struct ioeventfd* new;
     int rc = 0;
 
-    // check if the configuration is valid
+    if (WARN_ON_ONCE(!dm || !config)) {
+        return -EINVAL;
+    }
+
     if (!bao_ioeventfd_config_valid(config)) {
         return -EINVAL;
     }
 
-    // get the eventfd from the file descriptor
     eventfd = eventfd_ctx_fdget(config->fd);
     if (IS_ERR(eventfd)) {
         return PTR_ERR(eventfd);
     }
 
-    // allocate a new ioeventfd object
     new = kzalloc(sizeof(*new), GFP_KERNEL);
     if (!new) {
         rc = -ENOMEM;
-        goto err;
+        goto err_put_eventfd;
     }
 
-    // initialize the ioeventfd
     INIT_LIST_HEAD(&new->list);
     new->addr = config->addr;
     new->length = config->len;
     new->eventfd = eventfd;
-
-    /*
-     * BAO_IOEVENTFD_FLAG_DATAMATCH flag is set in virtio 1.0 support, the
-     * writing of notification register of each virtqueue may trigger the
-     * notification. There is no data matching requirement.
-     */
-    if (config->flags & BAO_IOEVENTFD_FLAG_DATAMATCH) {
+    new->wildcard = !(config->flags & BAO_IOEVENTFD_FLAG_DATAMATCH);
+    if (!new->wildcard) {
         new->data = config->data;
-    } else {
-        new->wildcard = true;
     }
 
     mutex_lock(&dm->ioeventfds_lock);
 
-    // check if the ioeventfd is conflict with other ioeventfds
     if (bao_ioeventfd_is_conflict(dm, new)) {
         rc = -EEXIST;
-        goto err_unlock;
+        goto err_unlock_free;
     }
 
-    // register the I/O range monitor into the Ioeventfd client
     rc = bao_io_client_range_add(dm->ioeventfd_client, new->addr, new->addr + new->length - 1);
     if (rc < 0) {
-        goto err_unlock;
+        goto err_unlock_free;
     }
 
-    // add the ioeventfd to the list
     list_add_tail(&new->list, &dm->ioeventfds);
     mutex_unlock(&dm->ioeventfds_lock);
 
-    return rc;
+    return 0;
 
-err_unlock:
+err_unlock_free:
     mutex_unlock(&dm->ioeventfds_lock);
     kfree(new);
-err:
+err_put_eventfd:
     eventfd_ctx_put(eventfd);
     return rc;
 }
 
 /**
- * Deassign an eventfd from a DM and destroy the ioeventfd associated with
- * the eventfd.
- * @dm:	The DM to deassign the eventfd from
- * @config:	The configuration of the eventfd
+ * bao_ioeventfd_deassign - Deassign and destroy an eventfd from a DM
+ * @dm: Bao device model to deassign the eventfd from
+ * @config: Configuration of the eventfd to remove
+ *
+ * Return: 0 on success, a negative error code on failure
  */
 static int bao_ioeventfd_deassign(struct bao_dm* dm, struct bao_ioeventfd* config)
 {
     struct ioeventfd* p;
     struct eventfd_ctx* eventfd;
 
-    // get the eventfd from the file descriptor
+    if (WARN_ON_ONCE(!dm || !config)) {
+        return -EINVAL;
+    }
+
     eventfd = eventfd_ctx_fdget(config->fd);
     if (IS_ERR(eventfd)) {
         return PTR_ERR(eventfd);
     }
 
     mutex_lock(&dm->ioeventfds_lock);
+
     list_for_each_entry(p, &dm->ioeventfds, list)
     {
         if (p->eventfd != eventfd) {
             continue;
         }
-        // delete the I/O range monitor from the Ioeventfd client
+
         bao_io_client_range_del(dm->ioeventfd_client, p->addr, p->addr + p->length - 1);
-        // shutdown the ioeventfd
+
         bao_ioeventfd_shutdown(dm, p);
         break;
     }
-    mutex_unlock(&dm->ioeventfds_lock);
 
-    // unregister the eventfd
+    mutex_unlock(&dm->ioeventfds_lock);
     eventfd_ctx_put(eventfd);
+
     return 0;
 }
 
 /**
- * Handle the Ioeventfd client I/O request
- * This function is called by the I/O client kernel thread
- * (bao_io_client_kernel_thread)
- * @client: The Ioeventfd client that the I/O request belongs to
- * @req: The I/O request to be handled
+ * bao_ioeventfd_handler - Handle an Ioeventfd client I/O request
+ * @client: Ioeventfd client associated with the request
+ * @req: I/O request to process
+ *
+ * Processes I/O requests from the Bao I/O client kernel thread
+ * (bao_io_client_kernel_thread). For READ operations, the value is
+ * ignored and set to 0 since virtio MMIO drivers only write to the
+ * `QueueNotify` field. WRITE operations are checked against the
+ * registered ioeventfds, and the corresponding eventfd is signaled
+ * if a match is found.
+ *
+ * Return: 0 on success, a negative error code on failure
  */
 static int bao_ioeventfd_handler(struct bao_io_client* client, struct bao_virtio_request* req)
 {
     struct ioeventfd* p;
 
-    /*
-     * I/O requests are dispatched by range check only, so a
-     * bao_io_client need process both READ and WRITE accesses
-     * of same range. READ accesses are safe to be ignored here
-     * because virtio MMIO drivers only write into the notify
-     * register (`QueueNotify` field) for notification.
-     * In fact, the read request won't exist since
-     * the `QueueNotify` field is WRITE ONLY from the driver
-     * and read only from the device.
-     */
+    if (WARN_ON_ONCE(!client || !req)) {
+        return -EINVAL;
+    }
+
     if (req->op == BAO_IO_READ) {
         req->value = 0;
         return 0;
@@ -253,13 +275,11 @@ static int bao_ioeventfd_handler(struct bao_io_client* client, struct bao_virtio
 
     mutex_lock(&client->dm->ioeventfds_lock);
 
-    // find the matched ioeventfd
     p = bao_ioeventfd_match(client->dm, req->addr, req->value, req->access_width);
-
-    // if matched, signal the eventfd
     if (p) {
         eventfd_signal(p->eventfd);
     }
+
     mutex_unlock(&client->dm->ioeventfds_lock);
 
     return 0;
@@ -267,17 +287,14 @@ static int bao_ioeventfd_handler(struct bao_io_client* client, struct bao_virtio
 
 int bao_ioeventfd_client_config(struct bao_dm* dm, struct bao_ioeventfd* config)
 {
-    // check if the DM and configuration are valid
-    if (WARN_ON(!dm || !config)) {
+    if (WARN_ON_ONCE(!dm || !config)) {
         return -EINVAL;
     }
 
-    // deassign the eventfd from the DM
     if (config->flags & BAO_IOEVENTFD_FLAG_DEASSIGN) {
         bao_ioeventfd_deassign(dm, config);
     }
 
-    // assign the eventfd to the DM
     return bao_ioeventfd_assign(dm, config);
 }
 
@@ -285,16 +302,18 @@ int bao_ioeventfd_client_init(struct bao_dm* dm)
 {
     char name[BAO_NAME_MAX_LEN];
 
+    if (WARN_ON_ONCE(!dm)) {
+        return -EINVAL;
+    }
+
     mutex_init(&dm->ioeventfds_lock);
     INIT_LIST_HEAD(&dm->ioeventfds);
 
-    // create a new name for the Ioeventfd client based on type and DM ID
     snprintf(name, sizeof(name), "bao-ioevfdc%u", dm->info.id);
 
-    // create a new I/O client (Ioeventfd client)
     dm->ioeventfd_client = bao_io_client_create(dm, bao_ioeventfd_handler, NULL, false, name);
     if (!dm->ioeventfd_client) {
-        return -EINVAL;
+        return -ENOMEM;
     }
 
     return 0;
@@ -302,10 +321,14 @@ int bao_ioeventfd_client_init(struct bao_dm* dm)
 
 void bao_ioeventfd_client_destroy(struct bao_dm* dm)
 {
-    struct ioeventfd *p, *next;
+    struct ioeventfd* p;
+    struct ioeventfd* next;
+
+    if (WARN_ON_ONCE(!dm)) {
+        return;
+    }
 
     mutex_lock(&dm->ioeventfds_lock);
-    // shutdown all the ioeventfds
     list_for_each_entry_safe(p, next, &dm->ioeventfds, list) bao_ioeventfd_shutdown(dm, p);
     mutex_unlock(&dm->ioeventfds_lock);
 }

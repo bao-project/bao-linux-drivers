@@ -16,13 +16,13 @@ export KERN_DIR=path/to/your/linux
 make ipc
 ```
 
-3. Copy the `ipc.ko` file to your target filesystem as `bao_ipc.ko`.
+3. Copy the `bao-ipc.ko` file to your target filesystem.
 
 ### Run instructions
 
 1. When the Backend VM boots up, insert the kernel module:
 ```
-insmod bao_ipc.ko
+insmod bao-ipc.ko
 ```
 
 2. From now on, you should be able to see the `/dev/baoipcX` device node if configured any Bao IPC object.

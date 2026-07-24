@@ -5,27 +5,39 @@
  * Copyright (c) Bao Project and Contributors. All rights reserved.
  *
  * Authors:
- *	João Peixoto <joaopeixotooficial@gmail.com>
+ *	João Peixoto <joaopeixoto@osyx.tech>
+ *	José Martins <jose@osyx.tech>
+ *	David Cerdeira <davidmcerdeira@osyx.tech>
  */
 
-#include "bao.h"
-#include "hypercall.h"
-#include <linux/anon_inodes.h>
-#include <linux/device.h>
+#include <bao.h>
+#include <hypercall.h>
 #include <linux/io.h>
-#include <linux/miscdevice.h>
 #include <linux/mm.h>
-#include <linux/module.h>
-#include <linux/slab.h>
+#include <linux/anon_inodes.h>
+#include <linux/file.h>
 
-/* List of all Backend DMs */
+/*
+ * List of all backend device models (DMs)
+ */
 LIST_HEAD(bao_dm_list);
 
 /*
- * bao_dm_list is read in a worker thread which dispatch I/O requests and
- * is wrote in DM creation ioctl. This rwlock mechanism is used to protect it.
+ * Lock to protect bao_dm_list
  */
 DEFINE_RWLOCK(bao_dm_list_lock);
+
+static void bao_dm_get(struct bao_dm* dm)
+{
+    refcount_inc(&dm->refcount);
+}
+
+static void bao_dm_put(struct bao_dm* dm)
+{
+    if (refcount_dec_and_test(&dm->refcount)) {
+        kfree(dm);
+    }
+}
 
 static int bao_dm_open(struct inode* inode, struct file* filp)
 {
@@ -35,27 +47,147 @@ static int bao_dm_open(struct inode* inode, struct file* filp)
 static int bao_dm_release(struct inode* inode, struct file* filp)
 {
     struct bao_dm* dm = filp->private_data;
-    kfree(dm);
+
+    if (WARN_ON_ONCE(!dm)) {
+        return -ENODEV;
+    }
+
+    filp->private_data = NULL;
+    bao_dm_put(dm);
+
     return 0;
 }
 
+static long bao_dm_ioctl(struct file* filp, unsigned int cmd, unsigned long arg)
+{
+    struct bao_dm* dm = filp->private_data;
+    int rc;
+
+    if (WARN_ON_ONCE(!dm)) {
+        return -ENODEV;
+    }
+
+    switch (cmd) {
+        case BAO_IOCTL_IO_CLIENT_ATTACH: {
+            struct bao_virtio_request* req;
+
+            req = memdup_user((void __user*)arg, sizeof(*req));
+            if (IS_ERR(req)) {
+                rc = PTR_ERR(req);
+                break;
+            }
+
+            if (!dm->control_client) {
+                rc = -ENOENT;
+                goto out_free;
+            }
+
+            rc = bao_io_client_attach(dm->control_client);
+            if (rc) {
+                goto out_free;
+            }
+
+            rc = bao_io_client_request(dm->control_client, req);
+            if (rc) {
+                goto out_free;
+            }
+
+            if (copy_to_user((void __user*)arg, req, sizeof(*req))) {
+                rc = -EFAULT;
+                goto out_free;
+            }
+
+            rc = 0;
+
+out_free:
+            kfree(req);
+            break;
+        }
+        case BAO_IOCTL_IO_REQUEST_COMPLETE: {
+            struct bao_virtio_request* req;
+            struct bao_remio_hypercall_ctx ctx;
+
+            req = memdup_user((void __user*)arg, sizeof(*req));
+            if (IS_ERR(req)) {
+                rc = PTR_ERR(req);
+                break;
+            }
+
+            ctx.dm_id = req->dm_id;
+            ctx.addr = req->addr;
+            ctx.op = req->op;
+            ctx.value = req->value;
+            ctx.access_width = req->access_width;
+            ctx.request_id = req->request_id;
+
+            rc = bao_remio_hypercall(&ctx);
+            kfree(req);
+
+            break;
+        }
+        case BAO_IOCTL_IOEVENTFD: {
+            struct bao_ioeventfd ioeventfd;
+
+            if (copy_from_user(&ioeventfd, (void __user*)arg, sizeof(struct bao_ioeventfd))) {
+                return -EFAULT;
+            }
+
+            rc = bao_ioeventfd_client_config(dm, &ioeventfd);
+            break;
+        }
+        case BAO_IOCTL_IRQFD: {
+            struct bao_irqfd irqfd;
+
+            if (copy_from_user(&irqfd, (void __user*)arg, sizeof(struct bao_irqfd))) {
+                return -EFAULT;
+            }
+
+            rc = bao_irqfd_server_config(dm, &irqfd);
+            break;
+        }
+        default:
+            rc = -ENOTTY;
+            break;
+    }
+
+    return rc;
+}
+
 /**
- * @brief IOCTL handler for the backend DM mmap operation
- * @note This function is used to map the previosuly allocated kernel memory
- * region of the backend DM to the userspace virtual address space
- * @filp: The file pointer of the DM
- * @vma: Contains the information about the virtual address range that is used
- * to access
- * @return: 0 on success, <0 on failure
+ * bao_dm_mmap - mmap backend DM shared memory to userspace
+ * @filp: File pointer for the DM device
+ * @vma: Virtual memory area for mapping
+ *
+ * Return: 0 on success, negative errno on failure
  */
 static int bao_dm_mmap(struct file* filp, struct vm_area_struct* vma)
 {
     struct bao_dm* dm = filp->private_data;
+    unsigned long vsize;
+    unsigned long offset;
+    phys_addr_t phys;
 
-    unsigned long vsize = vma->vm_end - vma->vm_start;
+    if (WARN_ON_ONCE(!dm)) {
+        return -ENODEV;
+    }
 
-    if (remap_pfn_range(vma, vma->vm_start, dm->info.shmem_addr >> PAGE_SHIFT, vsize,
-            vma->vm_page_prot)) {
+    vsize = vma->vm_end - vma->vm_start;
+    offset = vma->vm_pgoff << PAGE_SHIFT;
+
+    if (!vsize || offset) {
+        return -EINVAL;
+    }
+
+    if (vsize > dm->info.shmem_size) {
+        return -EINVAL;
+    }
+
+    phys = dm->info.shmem_addr;
+    if (!PAGE_ALIGNED(phys)) {
+        return -EINVAL;
+    }
+
+    if (remap_pfn_range(vma, vma->vm_start, phys >> PAGE_SHIFT, vsize, vma->vm_page_prot)) {
         return -EFAULT;
     }
 
@@ -63,16 +195,21 @@ static int bao_dm_mmap(struct file* filp, struct vm_area_struct* vma)
 }
 
 /**
- * @brief IOCTL handler for the backend DM llseek operation
- * @file: The file pointer of the DM
- * @offset: The offset to seek
- * @whence: The seek operation
- * @return: >=0 on success, <0 on failure
+ * bao_dm_llseek - Adjust file offset for backend DM device
+ * @file: File pointer for the DM device
+ * @offset: Offset to seek
+ * @whence: Reference point (SEEK_SET, SEEK_CUR, SEEK_END)
+ *
+ * Return: New file position on success, negative errno on failure
  */
 static loff_t bao_dm_llseek(struct file* file, loff_t offset, int whence)
 {
     struct bao_dm* bao = file->private_data;
     loff_t new_pos;
+
+    if (WARN_ON_ONCE(!bao)) {
+        return -ENODEV;
+    }
 
     switch (whence) {
         case SEEK_SET:
@@ -82,23 +219,21 @@ static loff_t bao_dm_llseek(struct file* file, loff_t offset, int whence)
             new_pos = file->f_pos + offset;
             break;
         case SEEK_END:
-            new_pos = bao->info.shmem_addr + bao->info.shmem_size + offset;
+            new_pos = bao->info.shmem_size + offset;
             break;
         default:
             return -EINVAL;
     }
 
-    // Ensure new_pos is within the valid range of the total shared memory
-    if (new_pos < 0 || (new_pos > (bao->info.shmem_addr + bao->info.shmem_size + offset))) {
+    if (new_pos < 0 || new_pos > bao->info.shmem_size) {
         return -EINVAL;
     }
 
     file->f_pos = new_pos;
-
     return new_pos;
 }
 
-static struct file_operations bao_dm_fops = {
+static const struct file_operations bao_dm_fops = {
     .owner = THIS_MODULE,
     .open = bao_dm_open,
     .release = bao_dm_release,
@@ -110,162 +245,178 @@ static struct file_operations bao_dm_fops = {
 struct bao_dm* bao_dm_create(struct bao_dm_info* info)
 {
     struct bao_dm* dm;
+    struct bao_dm* tmp;
     char name[BAO_NAME_MAX_LEN];
 
-    // verify if already exists a DM with the same virtual ID
-    read_lock(&bao_dm_list_lock);
-    list_for_each_entry(dm, &bao_dm_list, list)
-    {
-        if (dm->info.id == info->id) {
-            read_unlock(&bao_dm_list_lock);
-            return NULL;
-        }
-    }
-    read_unlock(&bao_dm_list_lock);
-
-    // allocate memory for the DM
-    dm = kzalloc(sizeof(struct bao_dm), GFP_KERNEL);
-    if (!dm) {
-        pr_err("%s: kzalloc failed\n", __FUNCTION__);
+    if (WARN_ON(!info)) {
         return NULL;
     }
 
-    // initialize the DM structure
+    dm = kzalloc(sizeof(*dm), GFP_KERNEL);
+    if (!dm) {
+        return NULL;
+    }
+
+    INIT_LIST_HEAD(&dm->list);
     INIT_LIST_HEAD(&dm->io_clients);
     init_rwsem(&dm->io_clients_lock);
 
-    // set the DM fields
+    refcount_set(&dm->refcount, 1);
     dm->info = *info;
 
-    // initialize the I/O request client
     bao_io_dispatcher_init(dm);
 
-    // add the DM to the list
-    write_lock_bh(&bao_dm_list_lock);
-    list_add(&dm->list, &bao_dm_list);
-    write_unlock_bh(&bao_dm_list_lock);
-
-    // create the Control client
     snprintf(name, sizeof(name), "bao-ioctlc%u", dm->info.id);
     dm->control_client = bao_io_client_create(dm, NULL, NULL, true, name);
-
-    // initialize the Ioeventfd client
-    bao_ioeventfd_client_init(dm);
-
-    // initialize the Irqfd server
-    bao_irqfd_server_init(dm);
-
-    // map the memory region to the kernel virtual address space
-    dm->shmem_base_addr = memremap(dm->info.shmem_addr, dm->info.shmem_size, MEMREMAP_WB);
-    if (dm->shmem_base_addr == NULL) {
-        pr_err("%s: failed to map memory region for dm %d\n", __FUNCTION__, dm->info.id);
-        return NULL;
+    if (!dm->control_client) {
+        pr_err("%s: failed to create control client for DM %u\n", __func__, dm->info.id);
+        goto err_remove_dm;
     }
 
+    if (bao_ioeventfd_client_init(dm)) {
+        pr_err("%s: failed to initialize ioeventfd for DM %u\n", __func__, dm->info.id);
+        goto err_destroy_io_clients;
+    }
+
+    if (bao_irqfd_server_init(dm)) {
+        pr_err("%s: failed to initialize irqfd for DM %u\n", __func__, dm->info.id);
+        goto err_destroy_io_clients;
+    }
+
+    dm->shmem_base_addr = memremap(dm->info.shmem_addr, dm->info.shmem_size, MEMREMAP_WB);
+    if (!dm->shmem_base_addr) {
+        pr_err("%s: failed to map memory region for DM %u\n", __func__, dm->info.id);
+        goto err_destroy_irqfd;
+    }
+
+    write_lock(&bao_dm_list_lock);
+    list_for_each_entry(tmp, &bao_dm_list, list)
+    {
+        if (tmp->info.id == info->id) {
+            write_unlock(&bao_dm_list_lock);
+            goto err_unmap;
+        }
+    }
+    list_add(&dm->list, &bao_dm_list);
+    write_unlock(&bao_dm_list_lock);
+
     return dm;
+
+err_unmap:
+    memunmap(dm->shmem_base_addr);
+
+err_destroy_irqfd:
+    bao_irqfd_server_destroy(dm);
+
+err_destroy_io_clients:
+    bao_io_clients_destroy(dm);
+
+err_remove_dm:
+    kfree(dm);
+
+    return NULL;
 }
 
 void bao_dm_destroy(struct bao_dm* dm)
 {
-    // mark as destroying
-    set_bit(BAO_DM_FLAG_DESTROYING, &dm->flags);
+    if (WARN_ON_ONCE(!dm)) {
+        return;
+    }
 
-    // remove the DM from the list
-    write_lock_bh(&bao_dm_list_lock);
+    write_lock(&bao_dm_list_lock);
     list_del_init(&dm->list);
-    write_unlock_bh(&bao_dm_list_lock);
+    write_unlock(&bao_dm_list_lock);
 
-    // clear the global fields
     dm->info.id = 0;
     dm->info.shmem_addr = 0;
     dm->info.shmem_size = 0;
     dm->info.irq = 0;
 
-    // unmap the memory region
-    memunmap(dm->shmem_base_addr);
+    if (dm->shmem_base_addr) {
+        memunmap(dm->shmem_base_addr);
+    }
 
-    // release the DM file descriptor
-    put_unused_fd(dm->info.fd);
+    if (dm->info.fd >= 0) {
+        put_unused_fd(dm->info.fd);
+    }
 
-    // destroy the Irqfd server
     bao_irqfd_server_destroy(dm);
-
-    // destroy the I/O clients
     bao_io_clients_destroy(dm);
-
-    // destroy the I/O dispatcher
     bao_io_dispatcher_destroy(dm);
 
-    // clear the destroying flag
-    clear_bit(BAO_DM_FLAG_DESTROYING, &dm->flags);
-
-    // free the DM
-    kfree(dm);
+    bao_dm_put(dm);
 }
 
 /**
- * Create an anonymous inode for the DM abstraction
- * @note: The anonymous inode is used to expose the DM to userspace
- * 	  	  and allow the frontend DM to request services from the backend
- * DM directly through the file descriptor This function should be called after
- * the DM is created and invoked by the frontend DM (userspace process) to
- * create the anonymous inode inside the process file descriptor table
- * @dm: The DM to create the anonymous inode
- * @return: >=0 on success, <0 on failure
+ * bao_dm_create_anonymous_inode - Create an anonymous inode for a backend DM
+ * @dm: The backend device model (DM)
+ *
+ * Creates an anonymous inode that exposes the backend DM to userspace.
+ * The frontend DM can use the returned file descriptor to request
+ * services from the backend DM directly.
+ *
+ * Return: File descriptor on success, negative errno on failure
  */
 static int bao_dm_create_anonymous_inode(struct bao_dm* dm)
 {
     char name[BAO_NAME_MAX_LEN];
     struct file* file;
-    int rc = 0;
+    int fd;
 
-    // create a new file descriptor for the DM
-    rc = get_unused_fd_flags(O_CLOEXEC);
-    if (rc < 0) {
-        pr_err("%s: get_unused_fd_flags failed\n", __FUNCTION__);
-        return rc;
+    if (WARN_ON_ONCE(!dm)) {
+        return -EINVAL;
     }
 
-    // create a name for the DM file descriptor
-    snprintf(name, sizeof(name), "bao-dm%u", dm->info.id);
+    fd = get_unused_fd_flags(O_CLOEXEC);
+    if (fd < 0) {
+        return fd;
+    }
 
-    // create a new anonymous inode for the DM abstraction
-    // the `bao_dm_fops` defines the behavior of this "file" and
-    // the `dm` is the private data
+    snprintf(name, sizeof(name), "bao-dm%u", dm->info.id);
+    bao_dm_get(dm);
     file = anon_inode_getfile(name, &bao_dm_fops, dm, O_RDWR);
     if (IS_ERR(file)) {
-        pr_err("%s: anon_inode_getfile failed\n", __FUNCTION__);
-        put_unused_fd(rc);
-        return rc;
+        bao_dm_put(dm);
+        put_unused_fd(fd);
+        return PTR_ERR(file);
     }
 
-    // associate the file descriptor `rc` with the struct file object `file`
-    // in the file descriptor table of the current process
-    // (expose the file descriptor `rc` to userspace)
-    fd_install(rc, file);
+    fd_install(fd, file);
+    dm->info.fd = fd;
 
-    // update the DM file descriptor
-    dm->info.fd = rc;
-
-    return rc;
+    return fd;
 }
 
 bool bao_dm_get_info(struct bao_dm_info* info)
 {
     struct bao_dm* dm;
-    bool rc = false;
+    bool found = false;
 
+    if (WARN_ON_ONCE(!info)) {
+        return false;
+    }
+
+    read_lock(&bao_dm_list_lock);
     list_for_each_entry(dm, &bao_dm_list, list)
     {
         if (dm->info.id == info->id) {
-            info->shmem_addr = dm->info.shmem_addr;
-            info->shmem_size = dm->info.shmem_size;
-            info->irq = dm->info.irq;
-            info->fd = bao_dm_create_anonymous_inode(dm);
-            rc = true;
+            bao_dm_get(dm);
+            found = true;
             break;
         }
     }
+    read_unlock(&bao_dm_list_lock);
 
-    return rc;
+    if (!found) {
+        return false;
+    }
+
+    info->shmem_addr = dm->info.shmem_addr;
+    info->shmem_size = dm->info.shmem_size;
+    info->irq = dm->info.irq;
+    info->fd = bao_dm_create_anonymous_inode(dm);
+
+    bao_dm_put(dm);
+
+    return true;
 }
