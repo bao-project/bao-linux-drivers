@@ -187,6 +187,7 @@ struct bao_dm {
     struct rw_semaphore io_clients_lock;
     struct list_head io_clients;
     struct bao_io_client* control_client;
+    char irq_name[BAO_NAME_MAX_LEN];
 };
 
 /**
